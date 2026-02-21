@@ -1,0 +1,6 @@
+[submodule "projects/mcp-ascii-align"]
+	path = projects/mcp-ascii-align
+	url = ssh://git@codeberg.org/dylanwang/mcp-ascii-align.git
+[submodule "projects/zish"]
+	path = projects/zish
+	url = ssh://git@codeberg.org/dylanwang/zish.git
