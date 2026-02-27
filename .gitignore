@@ -121,6 +121,12 @@ tags
 # Persistent undo
 [._]*.un~
 
+# === Node / VitePress ===
+node_modules/
+course/.vitepress/dist/
+course/.vitepress/cache/
+bun.lock
+
 # === Project specific ===
 .prompts/
 CLAUDE.md
