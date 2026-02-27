@@ -1,3 +1,8 @@
+clone:
+  git:
+    settings:
+      recursive: false
+
 when:
   branch: main
   event: push
