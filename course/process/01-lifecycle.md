@@ -390,6 +390,38 @@ wait 做三件事：
 
 如果父进程不调用 wait，子进程就一直是僵尸。如果父进程自己先退出了，子进程变成孤儿(orphan)，被 PID 1（init/systemd）收养，由 PID 1 负责 wait。
 
+:::thinking
+
+> 父子进程各有独立的地址空间，像两个平行时空。waitpid 怎么能跨时空等到子进程退出？
+
+关键在于：父子进程虽然各自独立，但它们的 `task_struct` 都在内核的同一块内存里。回看本篇开头的 `task_struct`，`parent` 指针和 `children` 链表维护着家族关系，`exit_code` 存放退出码，`__state` 记录进程状态。waitpid 的整个机制就建立在这些字段上。
+
+**父进程调用 waitpid** ：内核遍历父进程的 `children` 链表，找目标子进程。如果子进程还在运行，内核把父进程状态设为 `TASK_INTERRUPTIBLE`（可中断睡眠），父进程让出 CPU，不再被调度。
+
+**子进程退出** ：子进程调用 `exit()` 时，内核执行 `do_exit()`：把退出码写入 `task_struct.exit_code`，把进程状态设为 `EXIT_ZOMBIE`。然后检查父进程是否在等待队列上睡眠，如果是，唤醒它。
+
+**父进程被唤醒** ：内核从子进程的 `task_struct.exit_code` 读取退出状态，通过 waitpid 的返回值交给父进程，然后释放子进程的 `task_struct`，僵尸消失。
+
+```c
+// kernel/exit.c (simplified)
+do_exit(code):
+    tsk->exit_code = code
+    tsk->exit_state = EXIT_ZOMBIE
+    if parent is sleeping on wait_chldexit:
+        wake_up(parent)
+
+do_waitpid(pid):
+    child = find_child(current, pid)
+    if child->exit_state != EXIT_ZOMBIE:
+        sleep_on(current->wait_chldexit)  // block until child exits
+    status = child->exit_code
+    release_task(child)                   // free task_struct
+    return status
+```
+
+两个进程确实像平行时空，但内核是这两个时空的上帝视角。它能同时看到所有 `task_struct`，在子进程退出时主动通知睡眠中的父进程。跨进程等待的本质不是父进程"穿越"到子进程，而是内核作为中间人，在一方退出时唤醒另一方。
+:::
+
 到这里，fork → exec → wait 三步走完了。进程的生命周期本身并不复杂。但进程之间怎么通信？shell 执行 `ls | grep foo` 时，ls 的输出怎么流到 grep 的输入？这就需要文件描述符和管道。
 
 ## 文件描述符

@@ -21,12 +21,12 @@ export default withMermaid(
             return '</div>\n'
           }
         })
-        md.use(containerPlugin, 'insight', {
+        md.use(containerPlugin, 'thinking', {
           render(tokens, idx) {
             const token = tokens[idx]
             if (token.nesting === 1) {
-              const title = token.info.trim().slice('insight'.length).trim() || '一起思考 🤔'
-              return `<div class="insight custom-block"><p class="custom-block-title">${title}</p>\n`
+              const title = token.info.trim().slice('thinking'.length).trim() || '一起思考 🤔'
+              return `<div class="thinking custom-block"><p class="custom-block-title">${title}</p>\n`
             }
             return '</div>\n'
           }

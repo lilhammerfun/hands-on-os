@@ -51,7 +51,7 @@ Process Group (PGID = 200)
 
 | 调用 | 作用 |
 |------|------|
-| `setpgid(pid, pgid)` | 将进程 pid 的 PGID 设为 pgid。pid=0 表示自己，pgid=0 表示用 pid 做 PGID |
+| `setpgid(pid, pgid)` | 把进程 pid 放进 pgid 进程组。pid=0 表示自己。pgid=0 表示用 pid 自身的 PID 做 PGID（即创建新组并当组长） |
 | `getpgid(pid)` | 查询进程 pid 的 PGID |
 | `getpgrp()` | 等价于 `getpgid(0)`，查询自己的 PGID |
 
@@ -178,7 +178,7 @@ shell 启动一个前台命令时：
 
 如果一个后台进程试图从终端读取输入，又会发生什么？
 
-终端驱动检测到读取者的 PGID 和 `tty->pgrp` 不一致，说明它不是前台进程组的成员。终端驱动不会让它读到数据，而是向该进程的进程组发送 **SIGTTIN**。SIGTTIN 的默认动作是停止(Stop)进程。
+终端驱动检测到读取者的 PGID 和 `tty->pgrp` 不一致，说明它不是前台进程组的成员。终端驱动不会让它读到数据，而是向该进程的进程组发送 **SIGTTIN**（Terminal Input）。SIGTTIN 的默认动作是停止(Stop)进程。
 
 ```
 $ cat &             ← cat runs in background
@@ -189,7 +189,7 @@ $
 
 `cat` 试图读 stdin，收到 SIGTTIN，被停止。
 
-类似地，后台进程试图写入终端时，如果终端设置了 `TOSTOP` 标志，内核向其发送 **SIGTTOU**，同样停止进程。默认情况下 `TOSTOP` 未设置，后台进程可以直接写终端（所以后台 job 的输出会突然出现在屏幕上）。
+类似地，后台进程试图写入终端时，如果终端设置了 `TOSTOP` 标志，内核向其发送 **SIGTTOU**（Terminal Output），同样停止进程。默认情况下 `TOSTOP` 未设置，后台进程可以直接写终端（所以后台 job 的输出会突然出现在屏幕上）。
 
 这两个信号的意义是：**保证同一时刻只有一个 job 在读终端**。否则多个 job 同时读 stdin，谁读到哪个字节就变成不确定的了。
 
@@ -208,7 +208,7 @@ $ make -j8
 $
 ```
 
-`make` 停住了，shell 回来了。Ctrl+Z 和 Ctrl+C 的路径几乎相同（回顾控制终端一节的 Ctrl+C 路径图），区别只在信号类型：Ctrl+C 发 SIGINT（终止），Ctrl+Z 发 SIGTSTP（停止）。行规程调用 `kill_pgrp(tty->pgrp, SIGTSTP)`，前台进程组的所有进程收到 SIGTSTP，默认动作是进入 Stopped 状态。进程还在，但不再运行。
+`make` 停住了，shell 回来了。Ctrl+Z 和 Ctrl+C 的路径几乎相同（回顾控制终端一节的 Ctrl+C 路径图），区别只在信号类型：Ctrl+C 发 SIGINT（终止），Ctrl+Z 发 SIGTSTP（Terminal Stop，区别于 SIGSTOP，SIGTSTP 可以被进程捕获）。行规程调用 `kill_pgrp(tty->pgrp, SIGTSTP)`，前台进程组的所有进程收到 SIGTSTP，默认动作是进入 Stopped 状态。进程还在，但不再运行。
 
 shell 怎么知道进程停了？`waitpid` 有一个标志 `WUNTRACED`，加上这个标志后，`waitpid` 不仅在子进程退出时返回，在子进程被停止时也会返回。shell 检查返回状态发现是 Stopped，就把前台还给自己（`tcsetpgrp`），在内部的 job 表里记一笔，打印 `[1]+  Stopped`，然后显示提示符。
 
@@ -299,8 +299,8 @@ Shell 在启动时必须忽略三个信号：
 | 信号 | 为什么忽略 |
 |------|-----------|
 | SIGTSTP | 用户按 Ctrl+Z 时，shell 不能被暂停（否则谁来恢复它？） |
-| SIGTTIN | shell 有时在后台进程组里（前台 job 运行时），不能被停止 |
-| SIGTTOU | shell 需要调用 `tcsetpgrp` 修改终端属性，不能因此被停止 |
+| SIGTTOU | shell 把前台交给子进程组后，自己就变成后台了。前台 job 结束后，shell 需要调 `tcsetpgrp` 收回前台，但此刻 shell 还在后台。`tcsetpgrp` 内部通过 ioctl 修改终端属性，内核把这视为对终端的写操作，会向后台调用者发 SIGTTOU。不忽略的话，shell 恰恰在收回前台的那一刻把自己卡死 |
+| SIGTTIN | POSIX 对 job control shell 的推荐防护。正常情况下 shell 把前台交出去后阻塞在 `waitpid`，不会读终端，SIGTTIN 不会触发。但忽略它可以防止未来加功能时意外触发 |
 
 加上 SIGINT，shell 启动时至少忽略四个信号。子进程在 fork 后、exec 前要把这些信号全部重置为 SIG_DFL。
 
@@ -348,7 +348,21 @@ Shell 在启动时必须忽略三个信号：
 1. 终端模拟器创建一对 PTY(pseudo-terminal)
 2. 终端模拟器 fork 一个子进程
 3. 子进程调用 `setsid()`，创建新会话，自己成为 session leader
-4. 子进程调用 `open("/dev/pts/N")` 获得从端的 fd，这个从端成为新会话的控制终端
+4. 子进程调用 `open("/dev/pts/N")` 获得从端的 fd。**这一步同时触发了控制终端的自动绑定**，不需要额外的系统调用
+
+:::thinking
+
+> open() 怎么就自动绑定了控制终端？
+
+内核在 open 时检查四个条件，全部满足就自动绑定：
+
+1. 打开的是**终端设备**（不是普通文件）。不限于 `/dev/pts/N`，虚拟控制台（`/dev/tty1`）、串口（`/dev/ttyS0`）都算
+2. 调用者是 **session leader**
+3. 调用者**还没有控制终端**
+4. 没有传 `O_NOCTTY` 标志
+
+四个条件缺一不可。`setsid()` 创建了满足条件 2 和 3 的状态，紧接着 `open` 终端设备就触发绑定。如果不想要这个行为（比如 daemon 进程），open 时加 `O_NOCTTY` 即可跳过。
+:::
 5. 子进程用 `dup2` 把这个 fd 复制到 0、1、2 三个位置（见下文解释）
 6. 子进程 exec 执行 shell（如 bash、zsh）
 7. 从此，shell 的 stdin/stdout/stderr 都指向 PTY 从端，shell 是这个会话的 session leader
@@ -358,6 +372,8 @@ Shell 在启动时必须忽略三个信号：
 ```
 setsid()                        // create new session, detach from old terminal
 int fd = open("/dev/pts/0")     // open PTY slave, suppose returns fd=3
+                                // kernel: caller is session leader without controlling terminal
+                                //       → auto-bind /dev/pts/0 as controlling terminal
 dup2(fd, 0)                     // fd table[0] → /dev/pts/0  (stdin)
 dup2(fd, 1)                     // fd table[1] → /dev/pts/0  (stdout)
 dup2(fd, 2)                     // fd table[2] → /dev/pts/0  (stderr)
