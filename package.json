@@ -1,5 +1,5 @@
 {
-  "name": "linux-tutorials",
+  "name": "hands-on-os",
   "private": true,
   "scripts": {
     "dev": "vitepress dev course",

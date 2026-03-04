@@ -7,7 +7,7 @@ export default withMermaid(
     title: '从系统工具到操作系统',
     description: '用 Zig 写真实项目，在做的过程中学操作系统',
     lang: 'zh-CN',
-    base: '/linux-tutorials/',
+    base: '/hands-on-os/',
 
     markdown: {
       config: (md) => {

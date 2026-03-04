@@ -4,7 +4,7 @@
 
 ## 在线阅读
 
-https://dylanwang.codeberg.page/linux-tutorials/
+https://lilhammerfun.codeberg.page/hands-on-os/
 
 ## License
 
