@@ -388,7 +388,7 @@ $                   ← shell 和 sleep 一起死了，回到了系统 shell
 Zig 的 sigaction 在 `std.posix` 下：
 
 ```zig
-pub fn sigaction(sig: u8, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) void
+pub fn sigaction(sig: SIG, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) void
 ```
 
 Sigaction 结构体：
@@ -464,7 +464,7 @@ if (pid == 0) {
 
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
     _ = linux.execve(args[0].?, @ptrCast(&args), envp);
-    posix.exit(1);
+    linux.exit(1);
 } else {
     var status: u32 = 0;
     _ = linux.waitpid(pid, &status, 0);

@@ -509,31 +509,40 @@ pipe(fds);
 把 fork、exec、文件描述符、管道组合在一起，看 shell 执行 `ls | grep .zig` 的完整过程：
 
 ```zig
-const pipe_fds = try posix.pipe();  // create pipe
+const linux = std.os.linux;
+
+var pipe_fds: [2]i32 = undefined;
+_ = linux.pipe(&pipe_fds);  // create pipe
 
 // --- first child: ls ---
-const pid1 = try posix.fork();
+const rc1 = linux.fork();
+const pid1: i32 = @bitCast(@as(u32, @truncate(rc1)));
 if (pid1 == 0) {
-    posix.close(pipe_fds[0]);                          // don't need read end
-    try posix.dup2(pipe_fds[1], posix.STDOUT_FILENO);  // stdout → pipe write end
-    posix.close(pipe_fds[1]);                          // original fd redundant after dup2
-    return posix.execvpeZ("ls", &.{"ls"}, std.c.environ);
+    _ = linux.close(pipe_fds[0]);                      // don't need read end
+    _ = linux.dup2(pipe_fds[1], 1);                    // stdout → pipe write end
+    _ = linux.close(pipe_fds[1]);                      // original fd redundant after dup2
+    _ = linux.execve("/bin/ls", &.{ "ls", null }, @ptrCast(init.environ.block.slice.ptr));
+    linux.exit(1);
 }
 
 // --- second child: grep ---
-const pid2 = try posix.fork();
+const rc2 = linux.fork();
+const pid2: i32 = @bitCast(@as(u32, @truncate(rc2)));
 if (pid2 == 0) {
-    posix.close(pipe_fds[1]);                          // don't need write end
-    try posix.dup2(pipe_fds[0], posix.STDIN_FILENO);   // stdin → pipe read end
-    posix.close(pipe_fds[0]);                          // original fd redundant after dup2
-    return posix.execvpeZ("grep", &.{ "grep", ".zig" }, std.c.environ);
+    _ = linux.close(pipe_fds[1]);                      // don't need write end
+    _ = linux.dup2(pipe_fds[0], 0);                    // stdin → pipe read end
+    _ = linux.close(pipe_fds[0]);                      // original fd redundant after dup2
+    _ = linux.execve("/bin/grep", &.{ "grep", ".zig", null }, @ptrCast(init.environ.block.slice.ptr));
+    linux.exit(1);
 }
 
 // --- parent (shell) ---
-posix.close(pipe_fds[0]);   // close both pipe ends
-posix.close(pipe_fds[1]);   // otherwise grep's read end never gets EOF
-_ = posix.waitpid(pid1, 0);
-_ = posix.waitpid(pid2, 0);
+_ = linux.close(pipe_fds[0]);   // close both pipe ends
+_ = linux.close(pipe_fds[1]);   // otherwise grep's read end never gets EOF
+var status1: u32 = undefined;
+var status2: u32 = undefined;
+_ = linux.waitpid(pid1, &status1, 0);
+_ = linux.waitpid(pid2, &status2, 0);
 ```
 
 每个 close 都有原因：
@@ -578,109 +587,51 @@ _ = posix.waitpid(pid2, 0);
 
 REPL = Read-Eval-Print Loop（读取-执行-打印 循环）。Shell 的核心就是一个 REPL：显示提示符 → 读一行输入 → 执行 → 回到开头。
 
+**zish 使用 Zig nightly（0.16-dev）开发。**
+
 下面是用 Zig 实现 shell 时需要的 API 速查和实践指导。
 
-**IO**
+**IO：用原始系统调用，不用 buffered I/O**
 
-通过 `std.Io.File` 获取标准文件，reader/writer 必须自带 buffer，且需要传入 `Io` 上下文。
+Shell 的 REPL 每轮都要 fork。buffered I/O（如 `std.Io`）在用户态维护缓冲区，fork 后父子进程各持一份相同的缓冲区副本，两边各自 flush 会导致内容重复输出。更严重的是，如果 I/O 库内部使用线程（如 `Io.Threaded`），fork 后线程消失但锁状态被复制，可能死锁。
 
-**获取标准文件：**
+所有真实的 shell（bash、zsh、dash、fish）都用 raw `read()`/`write()` 做 REPL。这两个系统调用在 async-signal-safe 清单上，没有锁，没有缓冲区，没有线程，fork 对它们没有任何影响。
 
-```zig
-const stdin_file = std.Io.File.stdin();
-const stdout_file = std.Io.File.stdout();
-const stderr_file = std.Io.File.stderr();
-```
-
-**创建 Reader / Writer：**
+提示符和读取输入：
 
 ```zig
-const io = std.Io.init();
+const linux = std.os.linux;
 
-var stdin_buf: [8192]u8 = undefined;
-var stdout_buf: [4096]u8 = undefined;
+// print prompt — write is unbuffered, no flush needed
+_ = linux.write(1, "zish> ", 6);
 
-var stdin = stdin_file.reader(io, &stdin_buf);
-var stdout = stdout_file.writer(io, &stdout_buf);
+// read one line
+var line_buf: [4096]u8 = undefined;
+const n = linux.read(0, &line_buf, line_buf.len);
+if (n == 0) break;  // EOF (Ctrl+D)
+
+const line = line_buf[0..n - 1];  // strip trailing '\n'
 ```
 
-`Io` 上下文通过 `std.Io.init()` 获取。buffer 在栈上分配，大小自己定。
+`write(1, ...)` 直接写 fd 1（stdout），`read(0, ...)` 直接读 fd 0（stdin）。没有缓冲区，不需要 flush，fork 安全。
 
-**Reader 关键方法**（通过 `.interface` 访问，类型是 `std.Io.Reader`）：
+**API 签名速查**
 
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `peek` | `peek(n: usize) Error![]u8` | 查看 buffer 中下 n 字节，不消费 |
-| `toss` | `toss(n: usize) void` | 丢弃已 peek 的字节 |
-| `takeByte` | `takeByte() Error!u8` | 读一个字节 |
-| `takeDelimiterExclusive` | `takeDelimiterExclusive(delimiter: u8) DelimiterError![]u8` | 读到 delimiter 为止（不含） |
-| `readSliceAll` | `readSliceAll(buffer: []u8) Error!void` | 填满整个 buffer |
-| `readSliceShort` | `readSliceShort(buffer: []u8) ShortError!usize` | 读到有多少算多少 |
-
-**没有 `readUntilDelimiterAlloc`**。读一行要自己写循环，参考下面的 readLine。
-
-**Writer 关键方法**（同样通过 `.interface` 访问，类型是 `std.Io.Writer`）：
-
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `print` | `print(comptime fmt: []const u8, args: anytype) Error!void` | 格式化输出 |
-| `writeAll` | `writeAll(bytes: []const u8) Error!void` | 写入全部字节 |
-| `writeByte` | `writeByte(byte: u8) Error!void` | 写一个字节 |
-| `write` | `write(bytes: []const u8) Error!usize` | 写入，返回实际写入量 |
-| `flush` | `flush() Error!void` | 刷新 buffer 到底层文件 |
-
-**必须 flush**：writer 带 buffer，`print` 后数据可能还在 buffer 里。不 flush 就看不到输出，prompt 尤其如此：
-
-```zig
-stdout.interface.print("zish> ", .{}) catch {};
-stdout.interface.flush() catch {};
-```
-
-**readLine 参考实现**（用 `peek` + `toss` 逐字节读）：
-
-```zig
-fn readLine(alloc: Allocator, reader: *std.Io.Reader) !?[]u8 {
-    var line: ArrayList(u8) = .empty;
-    errdefer line.deinit(alloc);
-
-    while (true) {
-        const buf = reader.peek(1) catch |err| switch (err) {
-            error.EndOfStream => {
-                if (line.items.len > 0) return try line.toOwnedSlice(alloc);
-                return null;
-            },
-            else => return err,
-        };
-        if (buf.len == 0) {
-            if (line.items.len > 0) return try line.toOwnedSlice(alloc);
-            return null;
-        }
-        if (buf[0] == '\n') {
-            reader.toss(1);
-            return try line.toOwnedSlice(alloc);
-        }
-        try line.append(alloc, buf[0]);
-        reader.toss(1);
-    }
-}
-```
-
-调用：`readLine(alloc, &stdin.interface)`，返回 `null` 表示 EOF。
-
-**POSIX API 签名速查**
-
-高层封装在 `std.posix` 下，底层 Linux 系统调用在 `std.os.linux` 下。
+信号 / 终端控制在 `std.posix` 下，底层 Linux 系统调用在 `std.os.linux` 下。
 
 | API | 签名 | 说明 |
 |-----|------|------|
+| `read` | `std.os.linux.read(fd: i32, buf: [*]u8, count: usize) usize` | 读取，返回实际读取字节数；0 表示 EOF |
+| `write` | `std.os.linux.write(fd: i32, buf: [*]const u8, count: usize) usize` | 写入，返回实际写入字节数 |
 | `fork` | `std.os.linux.fork() usize` | 返回 0 → 子进程，>0 → 父进程（返回类型为 `usize`） |
-| `execve` | `std.os.linux.execve(path, argv, envp)` | 成功不返回；不搜索 PATH，需手动实现 PATH 查找；`execvpeZ` 已移除 |
+| `execve` | `std.os.linux.execve(path, argv, envp)` | 成功不返回；不搜索 PATH，需手动实现 PATH 查找 |
 | `waitpid` | `std.os.linux.waitpid(pid, &status, flags)` | `status` 以指针传入；flags=0 阻塞，`W.NOHANG` 非阻塞 |
 | `chdir` | `std.posix.chdir(dir_path: []const u8) ChangeCurDirError!void` | 接受普通切片，不要求 null 结尾 |
-| `pipe` | `std.posix.pipe() PipeError![2]fd_t` | `fds[0]` 读端，`fds[1]` 写端 |
-| `dup2` | `std.posix.dup2(old_fd, new_fd) !void` | 让 new_fd 成为 old_fd 的副本 |
-| `close` | `std.posix.close(fd) void` | 不返回 error |
-| `exit` | `std.posix.exit(status: u8) noreturn` | 参数 u8 |
+| `open` | `std.os.linux.open(path, flags, mode) usize` | 打开文件，返回 fd（`usize`） |
+| `pipe` | `std.os.linux.pipe(fd: *[2]i32) usize` | `fds[0]` 读端，`fds[1]` 写端 |
+| `dup2` | `std.os.linux.dup2(old: i32, new: i32) usize` | 让 new 成为 old 的副本 |
+| `close` | `std.os.linux.close(fd: fd_t) usize` | 关闭文件描述符 |
+| `exit` | `std.os.linux.exit(status: i32) noreturn` | 参数 i32 |
 
 Wait 状态解析：
 
@@ -724,9 +675,58 @@ const exe = b.addExecutable(.{
 
 `build.zig.zon` 中 `.name` 是 enum literal（不是字符串），`.fingerprint` 必填（第一次编译时从报错信息里复制）。
 
+**重定向**
+
+zish 目前能运行 `ls`，但不能运行 `ls > output.txt`。重定向的原理在文件描述符一节已经讲过：在子进程中，exec 之前，用 `open` + `dup2` 把 stdout 指向文件。
+
+实现分两步。
+
+**解析**：在参数列表中找到 `>` 或 `<`，提取后面的文件名，并把这两个 token（`>` 和文件名）从 argv 中去掉。`ls > output.txt` 解析后，argv 只剩 `{"ls", null}`，另外记住输出文件是 `output.txt`。
+
+**子进程中执行**：fork 之后、exec 之前，根据解析结果做重定向：
+
+```zig
+// output redirection: ls > output.txt
+// in child process, before exec:
+const linux = std.os.linux;
+const file: i32 = @bitCast(@as(u32, @truncate(linux.open(
+    filename,
+    .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+    0o644,
+))));
+_ = linux.dup2(file, 1);  // fd 1 now points to file
+_ = linux.close(file);    // original fd no longer needed
+// then exec...
+```
+
+输入重定向 `<` 同理，把 `WRONLY` 换成 `RDONLY`，把 `1`（stdout）换成 `0`（stdin）：
+
+```zig
+// input redirection: sort < data.txt
+const file: i32 = @bitCast(@as(u32, @truncate(linux.open(filename, .{ .ACCMODE = .RDONLY }, 0))));
+_ = linux.dup2(file, 0);
+_ = linux.close(file);
+```
+
+`open` 的第一个参数要求 null-terminated（`[*:0]const u8`）。解析时用和 argv 相同的原地写 `\0` 方式处理文件名就行。
+
+验证：
+
+```
+zish> ls > /tmp/out.txt
+zish> cat /tmp/out.txt
+build.zig
+build.zig.zon
+src
+zish> cat < /tmp/out.txt
+build.zig
+build.zig.zon
+src
+```
+
 **注意事项**
 
-- **exec 失败必须 `posix.exit(1)`**：否则子进程跌回 REPL 循环，出现两个 shell 同时读 stdin
+- **exec 失败必须 `linux.exit(1)`**：否则子进程跌回 REPL 循环，出现两个 shell 同时读 stdin
 - **`cd` 和 `exit` 不能 fork**：它们修改父进程状态，fork 后改的是子进程，父进程不受影响
-- **传环境变量**：`init.environ.block.slice.ptr` 传给 `execve` 第三个参数（`init` 来自 `std.Io.init()`）
+- **传环境变量**：`std.Io.init().environ.block.slice.ptr` 传给 `execve` 第三个参数
 - **ArrayList 改为 unmanaged**：所有操作都要传 allocator（`list.append(alloc, item)`）
