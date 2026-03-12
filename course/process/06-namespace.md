@@ -445,7 +445,7 @@ struct ns_common {
 | pivot_root | 交换 Mount namespace 的根挂载，比 chroot 更安全 |
 | veth | 虚拟网线对，连接不同 Network namespace |
 
-**核心洞察**：Linux 内核里没有「容器」这个概念，没有 container 系统调用，也没有 container 数据结构。容器就是一个普通进程，同时套上了一组 namespace（隔离它能看到的资源）加 cgroup（限制它能用多少资源）。Docker「创建容器」本质上就是 fork 一个进程，让它的 `nsproxy` 指向一组新建的 namespace，配好 cgroup，仅此而已。namespace 本身也不是什么新的内核对象类型，它只是把已有的全局资源（PID 表、挂载表、网络栈……）从「系统全局唯一」变成「per-namespace 一份」。
+Linux 内核里没有「容器」这个概念，没有 container 系统调用，也没有 container 数据结构。容器就是一个普通进程，同时套上了一组 namespace（隔离它能看到的资源）加 cgroup（限制它能用多少资源）。Docker「创建容器」本质上就是 fork 一个进程，让它的 `nsproxy` 指向一组新建的 namespace，配好 cgroup，仅此而已。namespace 本身也不是什么新的内核对象类型，它只是把已有的全局资源（PID 表、挂载表、网络栈……）从「系统全局唯一」变成「per-namespace 一份」。
 
 ---
 

@@ -319,7 +319,7 @@ task_struct
 | `cgroup_subsys_state` | 进程在某个控制器中所属的 cgroup 节点 |
 | `cgroup_subsys` | 描述控制器本身，注册 attach/fork/exit 回调 |
 
-**核心洞察**：namespace 隔离视图（进程看到什么），cgroup 限制配额（进程能用多少）。两者正交：namespace 不限资源，cgroup 不隔视图。容器把两者叠加。namespace 让进程以为自己独占系统，cgroup 确保它不能真的独占。
+namespace 隔离视图（进程看到什么），cgroup 限制配额（进程能用多少）。两者正交：namespace 不限资源，cgroup 不隔视图。容器把两者叠加。namespace 让进程以为自己独占系统，cgroup 确保它不能真的独占。
 
 ---
 
