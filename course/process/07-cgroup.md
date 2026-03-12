@@ -1,6 +1,6 @@
 # Cgroups
 
-在上一篇中，namespace 让容器看不到宿主机的进程、文件系统和网络栈。但"看不到"不等于"用不了"。一个运行在独立 namespace 中的进程，仍然可以调用 `malloc` 吃掉宿主机所有内存，用一个死循环占满所有 CPU 核心，或者用 fork bomb 耗尽系统的 PID 资源。namespace 隔离了视图，没有限制用量。
+上一课的 namespace 解决了隔离问题——让容器看不到宿主机的进程、文件系统和网络栈。但"看不到"不等于"用不了"。一个运行在独立 namespace 中的进程，仍然可以调用 `malloc` 吃掉宿主机所有内存，用一个死循环占满所有 CPU 核心，或者用 fork bomb 耗尽系统的 PID 资源。namespace 隔离了视图，没有限制用量。
 
 ```bash
 # this process can consume all host memory, regardless of namespace
@@ -9,7 +9,7 @@ stress --vm 1 --vm-bytes 8G
 
 不管这个 `stress` 在哪个 PID namespace、哪个 Mount namespace 里，它一样消耗 8 GB 物理内存。宿主机上的其他进程（包括其他容器）会因为内存不足被 OOM killer 杀掉。一个容器的失控导致所有容器受害。
 
-解决这个问题需要 **cgroup**（control group）。cgroup 是内核提供的资源限制机制，通过虚拟文件系统对一组进程施加配额。内核提供四类控制器分管不同资源：**CPU 控制器** 限制进程组的 CPU 时间，**内存控制器** 限制内存使用量并在超限时触发回收或杀死进程，**I/O 控制器** 限制对块设备的读写带宽，**PID 控制器** 限制进程组能创建的进程总数。最后看 **内核实现** 如何把进程和 cgroup 关联起来。
+解决这个问题需要 **cgroup**（control group）——内核提供的资源限制机制，通过虚拟文件系统对一组进程施加配额。cgroup 本身只是一个分组框架，真正的限制由挂载在上面的控制器完成。**CPU 控制器**限制进程组的 CPU 时间，**内存控制器**限制内存使用量并在超限时触发回收或杀死进程，**I/O 控制器**限制对块设备的读写带宽，**PID 控制器**限制能创建的进程总数。最后看**内核实现**如何把进程和 cgroup 关联起来。
 
 ## cgroup
 
@@ -120,10 +120,7 @@ echo 300 > /sys/fs/cgroup/group-b/cpu.weight
 # when only A is running: A gets 100% (weight only matters under contention)
 ```
 
-:::thinking
-
-> 有了 cpu.max 为什么还需要 cpu.weight？
-
+:::thinking 有了 cpu.max 为什么还需要 cpu.weight？
 `cpu.max` 设的是硬上限。假设一台 4 核机器上有两个容器 A 和 B，都设了 `cpu.max = 200000 100000`（最多 2 核）。当 A 空闲时，B 也只能用 2 核，剩下 2 核的计算能力白白浪费。`cpu.max` 防止单个容器吃光所有 CPU，但它会导致资源浪费。
 
 `cpu.weight` 设的是比例。没有硬上限，只在竞争时按比例分。A 空闲时，B 可以用满 4 核；A 和 B 同时忙时，按 weight 比例分配。不浪费资源，但也挡不住单个容器在无竞争时独占所有 CPU。
@@ -202,9 +199,7 @@ cat /sys/fs/cgroup/my-group/io.stat
 
 PID 控制器通过 `pids.max` 限制进程组能创建的进程总数，防止 fork bomb 耗尽系统 PID。
 
-:::thinking
-
-> fork bomb `:(){ :|:& };:` 为什么危险？
+:::thinking fork bomb :(){ :|:& };: 为什么危险？
 
 把这段 bash 展开：它定义了一个函数 `:`，函数体是 `: | : &`，然后调用 `:`。每次调用会产生两个新的 `:` 进程（一个管道的两端），每个新进程又各自产生两个。进程数量以 2^n 指数增长。几秒内就能创建几万个进程，耗尽系统的 PID 空间（默认上限 `/proc/sys/kernel/pid_max`，通常 32768 或 4194304）。PID 耗尽后，系统上任何程序都无法 `fork()`，包括 SSH 登录、cron 任务、系统服务。机器还在运行，但什么新进程都起不来，实际上已经不可用了。
 
@@ -335,32 +330,8 @@ task_struct
 - [`mm/memcontrol.c`](https://elixir.bootlin.com/linux/latest/source/mm/memcontrol.c) — 内存控制器：`mem_cgroup_charge()`、OOM 处理
 - [`kernel/cgroup/pids.c`](https://elixir.bootlin.com/linux/latest/source/kernel/cgroup/pids.c) — PID 控制器：`pids_can_fork()`
 
----
+:::practice 给 zish 加上隔离
+学完命名空间和 Cgroups，你已经掌握了 Linux 容器的两大支柱。现在可以给 zish 加上 Namespace 隔离和资源限制，让它变成一个简易容器。
 
-## 动手做一做
-
-用以下步骤实验 cgroup 资源限制。cgroup 是 Linux 内核功能，macOS 和 Windows 上不存在，需要在 Linux 环境中操作（虚拟机、WSL 2 或云服务器均可）。以下命令需要 root 权限。
-
-**1. 创建 cgroup 并启用控制器**
-
-创建一个子 cgroup，启用 CPU、内存和 PID 控制器。检查 `cgroup.controllers` 确认可用控制器，向根 cgroup 的 `cgroup.subtree_control` 写入需要启用的控制器，然后 `mkdir` 创建子 cgroup，验证子 cgroup 目录下出现了对应的控制文件（`cpu.max`、`memory.max`、`pids.max`）。
-
-**2. CPU 限制**
-
-把 `cpu.max` 设为 `50000 100000`（50% 单核），然后在该 cgroup 中运行一个 CPU 密集型进程（`stress --cpu 1` 或一个死循环脚本）。用 `top` 或 `htop` 观察它的 CPU 使用率是否被限制在 50% 左右。对比去掉限制后的效果。
-
-**3. 内存限制**
-
-把 `memory.max` 设为 `64M`，在该 cgroup 中运行 `stress --vm 1 --vm-bytes 128M`。观察进程是否被 OOM kill。用 `dmesg` 查看 OOM killer 的日志，确认它只杀了 cgroup 内的进程。再试试只设 `memory.high` 为 `32M`（不设 `memory.max`），观察进程是否变慢但不被杀。
-
-**4. PID 限制**
-
-把 `pids.max` 设为 `10`，在该 cgroup 中尝试运行 fork bomb。观察 fork 是否在第 10 个进程后开始失败，宿主机是否不受影响。
-
-**5. 清理**
-
-把进程移回根 cgroup（`echo $PID > /sys/fs/cgroup/cgroup.procs`），然后 `rmdir` 删除子 cgroup。注意：cgroup 目录下有进程时不能删除，必须先把所有进程移走。
-
----
-
-<!-- 下一篇：待补充 -->
+前往 [zish-03：隔离与移植](/zish/03-isolation) 继续实践。
+:::

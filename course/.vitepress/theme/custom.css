@@ -39,3 +39,41 @@
 .custom-block.thinking code {
   background-color: var(--vp-c-purple-soft);
 }
+
+.custom-block.practice {
+  border-color: var(--vp-c-green-soft);
+  color: var(--vp-c-text-1);
+  background-color: var(--vp-c-green-soft);
+}
+
+.custom-block.practice .custom-block-title {
+  color: var(--vp-c-green-1);
+}
+
+.custom-block.practice code {
+  background-color: var(--vp-c-green-soft);
+}
+
+/* mathjax3: hide assistive MathML (stripped from inline <style> to avoid Vue compiler errors) */
+mjx-assistive-mml {
+  position: absolute !important;
+  top: 0;
+  left: 0;
+  clip: rect(1px, 1px, 1px, 1px);
+  padding: 0 !important;
+  border: 0 !important;
+  height: 1px !important;
+  width: 1px !important;
+  overflow: hidden;
+}
+
+mjx-container {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+mjx-container[jax="SVG"][display="true"] {
+  display: block;
+  text-align: center;
+  margin: 1em 0;
+}

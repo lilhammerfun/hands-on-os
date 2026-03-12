@@ -1,6 +1,6 @@
 # 信号
 
-当我们在终端运行 `sleep 100`，然后按 Ctrl+C，程序立刻退出了。
+上一课讲了进程的创建、执行和回收，但进程在运行过程中，有时需要被外部打断。来看这样一个场景：在终端运行 `sleep 100`，然后按 Ctrl+C，程序立刻退出了。
 
 ```
 $ sleep 100
@@ -14,7 +14,7 @@ $
 
 硬件世界解决过同样的问题：**中断**(interrupt)。网卡收到数据包时通过电信号打断 CPU，CPU 跳到预先注册的处理代码执行。**信号**(signal) 是这个思路搬到进程层面，不是设备打断 CPU，而是内核打断进程。内核在进程的待处理集合中标记一个信号，下次该进程被调度运行时，强制跳转到处理代码。
 
-本篇讲信号机制的全貌：**信号机制**的定义和内核数据结构，三种**处置**方式和 sigaction 注册接口，**终端驱动**把 Ctrl+C 变成 SIGINT 的完整路径，三种**信号来源**，fork/exec 时的**信号继承**规则，以及 **SIGCHLD** 驱动的僵尸回收。
+信号就是这个机制。先看**信号机制**本身——内核用什么数据结构记录信号、怎么投递。进程收到信号后有三种选择：默认动作、忽略、自定义处理函数，这就是**处置**。Ctrl+C 是怎么变成 SIGINT 的？这条路径经过**终端驱动**。信号不只来自键盘，**信号来源**有三种：终端、内核、其他进程。fork 和 exec 时信号的处置怎么传递给子进程？这就是**信号继承**规则。最后，信号机制最重要的应用之一：父进程通过 **SIGCHLD** 知道子进程退出了，从而及时回收僵尸。
 
 ## 信号机制
 
@@ -368,119 +368,9 @@ if (@as(*volatile bool, @ptrCast(&got_sigchld)).*) {
 - [`kernel/signal.c`](https://elixir.bootlin.com/linux/latest/source/kernel/signal.c) — `get_signal()`：信号递送，检查 pending 并执行处置
 - [`fs/exec.c`](https://elixir.bootlin.com/linux/latest/source/fs/exec.c) — `flush_signal_handlers()`：exec 时重置信号处理器
 
-## 动手做一做：zish 信号处理
+:::practice 开始写 zish
+学完进程生命周期和信号这两课，你已经掌握了 fork/exec/wait、管道、信号处置和继承规则。这些正是实现一个 Shell 的基础 REPL 所需要的全部知识。
 
-上一篇实现的 zish 没有做任何信号处理。用户按 Ctrl+C 时，shell 自己也会被杀死：
+前往 [zish-01：基础 REPL](/zish/01-repl) 开始实践。
+:::
 
-```
-$ ./zish
-zish> sleep 100
-^C
-$                   ← shell 和 sleep 一起死了，回到了系统 shell
-```
-
-原因：Ctrl+C 向前台进程组发 SIGINT，zish 和子进程都在这个组里，所有进程的默认处置都是终止。
-
-需要的行为是：Ctrl+C 终止子进程，但 zish 自己不受影响。
-
-**API 速查**
-
-Zig 的 sigaction 在 `std.posix` 下：
-
-```zig
-pub fn sigaction(sig: SIG, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) void
-```
-
-Sigaction 结构体：
-
-```zig
-pub const Sigaction = struct {
-    handler: extern union {
-        handler: ?handler_fn,     // fn (i32) callconv(.c) void
-        sigaction: ?sigaction_fn,  // fn (i32, *siginfo_t, ?*anyopaque) callconv(.c) void
-    },
-    mask: sigset_t,
-    flags: c_ulong,
-};
-```
-
-SIG 常量：
-
-```zig
-posix.SIG.INT   // 2  Ctrl+C
-posix.SIG.DFL   // default disposition
-posix.SIG.IGN   // ignore
-```
-
-SA 标志：
-
-```zig
-posix.SA.RESTART     // auto-restart interrupted slow syscalls
-posix.SA.NOCLDSTOP   // no SIGCHLD when child stops
-posix.SA.NOCLDWAIT   // auto-reap children (no zombies)
-```
-
-**第一步：zish 启动时忽略 SIGINT**
-
-在 main 函数开头、进入 REPL 之前，把 SIGINT 的处置设为 SIG_IGN：
-
-```zig
-const posix = std.posix;
-
-const ign = posix.Sigaction{
-    .handler = .{ .handler = posix.SIG.IGN },
-    .mask = posix.sigemptyset(),
-    .flags = 0,
-};
-posix.sigaction(posix.SIG.INT, &ign, null);
-```
-
-这之后，zish 进程的 `action[2]`（SIGINT 的处置）被设为 SIG_IGN。Ctrl+C 对 zish 无效。
-
-**第二步：fork 后、exec 前，子进程重置 SIGINT 为默认**
-
-如果只做第一步，会引入一个新 bug。前文讲过：fork 会复制处置数组。zish 的 `action[2]` 是 SIG_IGN，fork 出来的子进程也是 SIG_IGN。exec 不会改变 SIG_IGN（它是常量，不依赖旧程序的代码）。结果就是 `sleep 100` 也忽略 SIGINT，按 Ctrl+C 毫无反应。
-
-修复：在 fork 和 exec 之间，子进程把 SIGINT 重置为 SIG_DFL。
-
-```zig
-const linux = std.os.linux;
-
-const rc = linux.fork();
-const pid: posix.pid_t = if (rc == 0) 0 else if (rc < std.math.maxInt(u63))
-    @bitCast(@as(u64, rc))
-else
-    std.debug.panic("fork failed: {}", .{std.posix.errno(rc)});
-
-if (pid == 0) {
-    // this is the child process (copy of zish)
-    // sigaction modifies the caller's own action[]
-    const dfl = posix.Sigaction{
-        .handler = .{ .handler = posix.SIG.DFL },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &dfl, null);
-
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
-    _ = linux.execve(args[0].?, @ptrCast(&args), envp);
-    linux.exit(1);
-} else {
-    var status: u32 = 0;
-    _ = linux.waitpid(pid, &status, 0);
-}
-```
-
-**验证**
-
-```
-$ ./zish
-zish> sleep 100
-^C                  ← sleep 被终止
-zish>               ← zish 还活着
-zish> sleep 5
-^C                  ← 再试一次，依然正常
-zish>
-```
-
-如果第二步没做，按 Ctrl+C 后 sleep 不会退出。如果第一步没做，按 Ctrl+C 后 zish 和 sleep 一起死。

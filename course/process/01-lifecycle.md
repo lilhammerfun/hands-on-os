@@ -1,6 +1,6 @@
 # 进程生命周期
 
-当我们在终端输入 `ls -l` 并按回车，屏幕上出现文件列表。但 shell 本身是一个进程，它不能直接"变成" ls。进程模型决定了它需要三步：
+从一个日常操作开始。当我们在终端输入 `ls -l` 并按回车，屏幕上出现文件列表。但 shell 本身是一个进程，它不能直接"变成" ls。进程模型决定了它需要三步：
 
 1. 复制自己（fork）
 2. 让副本变成 ls（exec）
@@ -19,7 +19,7 @@ sequenceDiagram
 
 再看 `ls | grep .zig`，两个命令同时运行，ls 的输出直接流入 grep 的输入。连接它们的是**管道**，通过**文件描述符**重定向实现。
 
-这三步加上连接它们的机制，就是本篇的全部内容。**进程**是程序的运行实例，内核用 task_struct 记录它的全部状态。**fork** 复制进程，**exec** 替换程序，**wait** 回收子进程，防止僵尸堆积。**文件描述符**是进程访问一切 I/O 的统一接口，**管道**通过文件描述符把两个进程的输入输出连在一起。
+这三步加上连接它们的机制，就是本篇的全部内容。先从**进程**本身开始——它是程序的运行实例，内核用 `task_struct` 记录它的全部状态。有了进程，就需要创建它：**fork** 复制当前进程，**exec** 把副本替换成新程序。子进程结束后必须被回收，否则会变成僵尸进程，这就是 **wait** 的作用。进程要和外界交互（读文件、写网络、连接管道），统一走**文件描述符**接口。两个进程的输入输出要串联起来，靠的是**管道**。
 
 ## 进程
 
@@ -149,11 +149,38 @@ Low Address
                                                  process gone
 ```
 
+:::thinking "就绪"到底是什么意思？
+状态图里的"就绪(Ready)"不是一个抽象概念，它在内核里有精确的含义：**进程的 `task_struct->__state` 被设为 `TASK_RUNNING`，并且 `task_struct` 被挂在 CPU 的运行队列(run queue)上。**
+
+注意一个反直觉的命名：Linux 内核用 `TASK_RUNNING` 同时表示"正在 CPU 上执行"和"就绪、等待被调度"这两种状态。区分它们的不是 `__state` 字段，而是进程是否实际占有 CPU。运行队列上可能有 10 个 `TASK_RUNNING` 的进程，但只有 1 个真正在执行，其余 9 个就是"就绪"。
+
+一个进程怎么变成就绪？**只有一种原因：它之前在等某个东西，那个东西完成了。** 具体场景：
+
+- **`read()` 的数据到了**：进程之前调 `read()` 等磁盘，内核把它的 `__state` 设为 `TASK_INTERRUPTIBLE` 并从运行队列移除。磁盘数据到达后，内核中断处理程序把 `__state` 改回 `TASK_RUNNING`，重新挂回运行队列。进程下一步要处理这块数据，但 CPU 正在跑别的进程，所以它排队。
+- **`sleep(5)` 到时间了**：定时器中断触发，内核发现倒计时归零，把进程 `__state` 改回 `TASK_RUNNING`，挂回运行队列。
+- **`pthread_mutex_lock()` 的锁被释放了**：持有者解锁时，内核唤醒等待队列上的进程，`__state` 改回 `TASK_RUNNING`。
+- **`waitpid()` 等待的子进程退出了**：子进程 `exit()` 时内核唤醒父进程，父进程重新就绪。
+
+所以"就绪"就是：**进程要执行的下一条指令不依赖任何外部事件，纯粹是 CPU 还没轮到它。** 调度器的 `pick_next_task()` 遍历运行队列，选中一个进程，它就从"就绪"变成"运行"。
+:::
+
 - **就绪 → 运行**：调度器选中这个进程，分配 CPU
 - **运行 → 就绪**：时间片(time slice)用完，让出 CPU
 - **运行 → 睡眠**：进程主动等待某件事（磁盘 I/O、网络数据、锁……）
 - **运行 → 僵尸**：进程调用 `exit()` 退出，但父进程还没调用 `wait()` 回收
 - **僵尸 → 消失**：父进程调用 `wait()` 读取退出状态，内核回收 PCB
+
+:::expand 上下文切换的开销
+每次状态转换涉及 CPU 从一个进程切到另一个进程，这就是上下文切换(context switch)。内核要做两件事：
+
+1. **保存/恢复寄存器**：把当前进程的通用寄存器、程序计数器、栈指针等保存到它的 `task_struct->thread`，再从下一个进程的 `task_struct->thread` 恢复。这部分由汇编代码 `__switch_to` 完成，本身很快，纳秒级。
+
+2. **切换页表**：把 CPU 的页表基址寄存器（x86 上是 CR3）指向新进程的页表。这会导致 TLB(Translation Lookaside Buffer) 失效——TLB 是 CPU 缓存的"虚拟地址 → 物理地址"映射，切换页表后这些缓存全部作废，后续每次内存访问都要重新查页表，直到 TLB 逐渐"暖"起来。
+
+真正昂贵的不是寄存器保存那几十条指令，而是 TLB 失效和 CPU 缓存(L1/L2/L3)变冷带来的间接开销。新进程访问的数据大概率不在缓存里，要从主存重新加载。一次上下文切换的直接开销在微秒级（1-10μs），但缓存变冷导致的后续性能下降可能持续数百微秒。
+
+这就是为什么 Linux 的 CFS 调度器不会让时间片太短——切换太频繁，大量 CPU 时间浪费在"暖缓存"上，而不是执行真正的计算。
+:::
 
 僵尸进程(zombie process)是一个常见问题：进程已经死了，但 PCB 还占着内核内存，等父进程来收尸。如果父进程从不调用 `wait()`，僵尸会一直存在。这就是为什么 shell 必须正确回收子进程。
 
@@ -302,9 +329,7 @@ Zig 标准库中的 exec 函数：
 | `execvpe` | 参数是切片 `[]const [*:0]const u8` |
 | `execveZ` | 最底层，直接对应系统调用，不搜 PATH，要求传绝对路径 |
 
-:::insight 一起思考 🤔
-> fork 和 exec 为什么是两个独立的系统调用，而不是一个 `create_process("ls", args)` 一步到位？
-
+:::thinking fork 和 exec 为什么是两个独立的系统调用，而不是一个 create_process("ls", args) 一步到位？
 Windows 就是这样做的（`CreateProcess()`），但 Unix 选择把"创建进程"和"加载程序"拆成两步。考虑 shell 要实现 `ls > output.txt`（把 ls 的输出重定向到文件）。如果只有 `CreateProcess`，API 就需要一个"重定向 stdout"的参数。如果还要支持切换工作目录、关闭某个文件描述符、改变环境变量……参数列表会无限膨胀。
 
 fork + exec 分离后，程序员可以在两者之间插入**任意系统调用**来配置子进程：
@@ -328,7 +353,8 @@ if (pid == 0) {
 fork + exec 的分离，把"配置子进程"从一个函数的参数列表，变成了一段可以写任意代码的区间。任何系统调用都可以用来配置子进程，不需要 API 设计者预先考虑所有场景。这是 Unix 进程模型的核心设计决策。管道的实现也是这个原理（后文管道一节展开）。
 :::
 
-:::expand fork 和 exec 也可以独立使用
+fork 和 exec 也可以独立使用。
+
 **fork() 不接 exec()**：复制当前进程，继续跑同一个程序：
 
 - **Redis RDB 持久化**：Redis 调用 `fork()` 创建子进程。子进程继承了父进程的全部内存数据（得益于 COW，几乎零开销），然后把数据快照写入磁盘。父进程继续响应客户端请求，完全不阻塞。
@@ -354,7 +380,6 @@ exec ./myapp --config production.toml
 如果不加 `exec`，`./myapp` 会作为 shell 的子进程运行，wrapper 脚本的 shell 进程仍然活着、占着资源、白白等在那里。加了 `exec` 后，进程数少一个，信号传递也更直接（`kill` wrapper 的 PID 就是直接 kill myapp）。Docker 的 entrypoint 脚本几乎都用这个模式：先做初始化，最后 `exec "$@"` 把 PID 1 让给真正的应用程序，这样容器的信号处理才能正确工作。
 
 终端登录也是同样的模式：`getty` 监听终端，收到输入后 `exec login`（getty 消失，变成 login）；`login` 验证密码后 `exec /bin/bash`（login 消失，变成 bash）。整个链条中 PID 始终是同一个，每一步都用 exec 而不是 fork+exec，因为前一个程序的使命已经结束，没有理由让它继续存在。
-:::
 
 ## wait
 
@@ -390,10 +415,7 @@ wait 做三件事：
 
 如果父进程不调用 wait，子进程就一直是僵尸。如果父进程自己先退出了，子进程变成孤儿(orphan)，被 PID 1（init/systemd）收养，由 PID 1 负责 wait。
 
-:::thinking
-
-> 父子进程各有独立的地址空间，像两个平行时空。waitpid 怎么能跨时空等到子进程退出？
-
+:::thinking waitpid 怎么跨进程等到子进程退出？
 关键在于：父子进程虽然各自独立，但它们的 `task_struct` 都在内核的同一块内存里。回看本篇开头的 `task_struct`，`parent` 指针和 `children` 链表维护着家族关系，`exit_code` 存放退出码，`__state` 记录进程状态。waitpid 的整个机制就建立在这些字段上。
 
 **父进程调用 waitpid** ：内核遍历父进程的 `children` 链表，找目标子进程。如果子进程还在运行，内核把父进程状态设为 `TASK_INTERRUPTIBLE`（可中断睡眠），父进程让出 CPU，不再被调度。
@@ -545,6 +567,44 @@ _ = linux.waitpid(pid1, &status1, 0);
 _ = linux.waitpid(pid2, &status2, 0);
 ```
 
+用 ls 子进程的视角，逐步看 fd 表发生了什么变化：
+
+```
+1. fork() 之后，子进程继承了父进程的 fd 表：
+
+   fd 0 → tty (stdin)
+   fd 1 → tty (stdout)          ← ls 会往这里写
+   fd 2 → tty (stderr)
+   fd 3 → pipe 读端文件对象      ← pipe() 创建的
+   fd 4 → pipe 写端文件对象      ← pipe() 创建的
+
+2. close(pipe_fds[0])，关掉读端（ls 只需要写）：
+
+   fd 0 → tty (stdin)
+   fd 1 → tty (stdout)
+   fd 2 → tty (stderr)
+   fd 3 → [空]
+   fd 4 → pipe 写端文件对象
+
+3. dup2(pipe_fds[1], 1)，把 fd 1 指向 fd 4 所指的文件对象：
+
+   fd 0 → tty (stdin)
+   fd 1 → pipe 写端文件对象      ← 原来指向 tty，现在指向管道写端
+   fd 2 → tty (stderr)
+   fd 3 → [空]
+   fd 4 → pipe 写端文件对象      ← 和 fd 1 指向同一个对象
+
+4. close(pipe_fds[1])，关掉原来的 fd 4（fd 1 已经指向写端了，fd 4 多余）：
+
+   fd 0 → tty (stdin)
+   fd 1 → pipe 写端文件对象      ← ls 往 fd 1 写，数据就进了管道
+   fd 2 → tty (stderr)
+   fd 3 → [空]
+   fd 4 → [空]
+```
+
+所以"重定向"的本质是：`dup2` 把 fd 1 这个槽位原来指向的 tty 文件对象换成了管道写端文件对象。ls 照常 `write(1, ...)` 往 fd 1 写，但数据不再去终端，而是进了管道缓冲区。grep 那边同理，`dup2(pipe_fds[0], 0)` 把 fd 0 从 tty 换成管道读端，`read(0, ...)` 读到的就是管道里的数据而不是键盘输入。
+
 每个 close 都有原因：
 
 | 谁 | 关闭什么 | 原因 |
@@ -582,151 +642,3 @@ _ = linux.waitpid(pid2, &status2, 0);
 - [`fs/exec.c`](https://elixir.bootlin.com/linux/latest/source/fs/exec.c) — `do_execveat_common()`：exec 的核心实现
 - [`kernel/exit.c`](https://elixir.bootlin.com/linux/latest/source/kernel/exit.c) — `do_exit()` / `do_wait()`：退出与回收
 - [`fs/pipe.c`](https://elixir.bootlin.com/linux/latest/source/fs/pipe.c) — `do_pipe2()`：管道创建
-
-## 动手做一做：zish 基础 REPL
-
-REPL = Read-Eval-Print Loop（读取-执行-打印 循环）。Shell 的核心就是一个 REPL：显示提示符 → 读一行输入 → 执行 → 回到开头。
-
-**zish 使用 Zig nightly（0.16-dev）开发。**
-
-下面是用 Zig 实现 shell 时需要的 API 速查和实践指导。
-
-**IO：用原始系统调用，不用 buffered I/O**
-
-Shell 的 REPL 每轮都要 fork。buffered I/O（如 `std.Io`）在用户态维护缓冲区，fork 后父子进程各持一份相同的缓冲区副本，两边各自 flush 会导致内容重复输出。更严重的是，如果 I/O 库内部使用线程（如 `Io.Threaded`），fork 后线程消失但锁状态被复制，可能死锁。
-
-所有真实的 shell（bash、zsh、dash、fish）都用 raw `read()`/`write()` 做 REPL。这两个系统调用在 async-signal-safe 清单上，没有锁，没有缓冲区，没有线程，fork 对它们没有任何影响。
-
-提示符和读取输入：
-
-```zig
-const linux = std.os.linux;
-
-// print prompt — write is unbuffered, no flush needed
-_ = linux.write(1, "zish> ", 6);
-
-// read one line
-var line_buf: [4096]u8 = undefined;
-const n = linux.read(0, &line_buf, line_buf.len);
-if (n == 0) break;  // EOF (Ctrl+D)
-
-const line = line_buf[0..n - 1];  // strip trailing '\n'
-```
-
-`write(1, ...)` 直接写 fd 1（stdout），`read(0, ...)` 直接读 fd 0（stdin）。没有缓冲区，不需要 flush，fork 安全。
-
-**API 签名速查**
-
-信号 / 终端控制在 `std.posix` 下，底层 Linux 系统调用在 `std.os.linux` 下。
-
-| API | 签名 | 说明 |
-|-----|------|------|
-| `read` | `std.os.linux.read(fd: i32, buf: [*]u8, count: usize) usize` | 读取，返回实际读取字节数；0 表示 EOF |
-| `write` | `std.os.linux.write(fd: i32, buf: [*]const u8, count: usize) usize` | 写入，返回实际写入字节数 |
-| `fork` | `std.os.linux.fork() usize` | 返回 0 → 子进程，>0 → 父进程（返回类型为 `usize`） |
-| `execve` | `std.os.linux.execve(path, argv, envp)` | 成功不返回；不搜索 PATH，需手动实现 PATH 查找 |
-| `waitpid` | `std.os.linux.waitpid(pid, &status, flags)` | `status` 以指针传入；flags=0 阻塞，`W.NOHANG` 非阻塞 |
-| `chdir` | `std.posix.chdir(dir_path: []const u8) ChangeCurDirError!void` | 接受普通切片，不要求 null 结尾 |
-| `open` | `std.os.linux.open(path, flags, mode) usize` | 打开文件，返回 fd（`usize`） |
-| `pipe` | `std.os.linux.pipe(fd: *[2]i32) usize` | `fds[0]` 读端，`fds[1]` 写端 |
-| `dup2` | `std.os.linux.dup2(old: i32, new: i32) usize` | 让 new 成为 old 的副本 |
-| `close` | `std.os.linux.close(fd: fd_t) usize` | 关闭文件描述符 |
-| `exit` | `std.os.linux.exit(status: i32) noreturn` | 参数 i32 |
-
-Wait 状态解析：
-
-```zig
-var status: u32 = undefined;
-_ = std.os.linux.waitpid(@intCast(pid), &status, 0);
-if (std.posix.W.IFEXITED(status)) {
-    const exit_code = std.posix.W.EXITSTATUS(status);
-}
-```
-
-**Null-terminated 字符串处理**
-
-`execve` 要求所有参数都是 null-terminated（`[*:0]const u8` 和 `[*:null]const ?[*:0]const u8`），但 Zig 的 `[]u8` 切片不带 null。**不能直接 `@ptrCast`**。
-
-思路是**原地写 `\0`**：读入一行后在 buffer 上把空格替换成 `\0`，末尾也写 `\0`，每个 token 的起始指针 cast 成 `[*:0]const u8` 就是合法的：
-
-```
-Input: "ls -la /tmp"
-      ┌──┬──┬───┬──┬───┬───┬───┬───┬───┬───┬───┬──┐
-buf:  │l │s │ \0│- │l  │a  │ \0│/  │t  │m  │p  │\0│
-      └──┴──┴───┴──┴───┴───┴───┴───┴───┴───┴───┴──┘
-       ↑         ↑              ↑
-    args[0]   args[1]        args[2]          args[3] = null
-```
-
-**Build 配置**
-
-`build.zig` 关键变化：`root_source_file` 必须包在 `root_module = b.createModule(...)` 里：
-
-```zig
-const exe = b.addExecutable(.{
-    .name = "zish",
-    .root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    }),
-});
-```
-
-`build.zig.zon` 中 `.name` 是 enum literal（不是字符串），`.fingerprint` 必填（第一次编译时从报错信息里复制）。
-
-**重定向**
-
-zish 目前能运行 `ls`，但不能运行 `ls > output.txt`。重定向的原理在文件描述符一节已经讲过：在子进程中，exec 之前，用 `open` + `dup2` 把 stdout 指向文件。
-
-实现分两步。
-
-**解析**：在参数列表中找到 `>` 或 `<`，提取后面的文件名，并把这两个 token（`>` 和文件名）从 argv 中去掉。`ls > output.txt` 解析后，argv 只剩 `{"ls", null}`，另外记住输出文件是 `output.txt`。
-
-**子进程中执行**：fork 之后、exec 之前，根据解析结果做重定向：
-
-```zig
-// output redirection: ls > output.txt
-// in child process, before exec:
-const linux = std.os.linux;
-const file: i32 = @bitCast(@as(u32, @truncate(linux.open(
-    filename,
-    .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
-    0o644,
-))));
-_ = linux.dup2(file, 1);  // fd 1 now points to file
-_ = linux.close(file);    // original fd no longer needed
-// then exec...
-```
-
-输入重定向 `<` 同理，把 `WRONLY` 换成 `RDONLY`，把 `1`（stdout）换成 `0`（stdin）：
-
-```zig
-// input redirection: sort < data.txt
-const file: i32 = @bitCast(@as(u32, @truncate(linux.open(filename, .{ .ACCMODE = .RDONLY }, 0))));
-_ = linux.dup2(file, 0);
-_ = linux.close(file);
-```
-
-`open` 的第一个参数要求 null-terminated（`[*:0]const u8`）。解析时用和 argv 相同的原地写 `\0` 方式处理文件名就行。
-
-验证：
-
-```
-zish> ls > /tmp/out.txt
-zish> cat /tmp/out.txt
-build.zig
-build.zig.zon
-src
-zish> cat < /tmp/out.txt
-build.zig
-build.zig.zon
-src
-```
-
-**注意事项**
-
-- **exec 失败必须 `linux.exit(1)`**：否则子进程跌回 REPL 循环，出现两个 shell 同时读 stdin
-- **`cd` 和 `exit` 不能 fork**：它们修改父进程状态，fork 后改的是子进程，父进程不受影响
-- **传环境变量**：`std.Io.init().environ.block.slice.ptr` 传给 `execve` 第三个参数
-- **ArrayList 改为 unmanaged**：所有操作都要传 allocator（`list.append(alloc, item)`）

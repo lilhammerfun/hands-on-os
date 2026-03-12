@@ -1,22 +1,52 @@
 import { defineConfig } from 'vitepress'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 import containerPlugin from 'markdown-it-container'
+import mathjax3 from 'markdown-it-mathjax3'
+
+const mathjaxTags = [
+  'mjx-container', 'mjx-assistive-mml',
+  'math', 'maction', 'maligngroup', 'malignmark', 'menclose', 'merror',
+  'mfenced', 'mfrac', 'mi', 'mlongdiv', 'mmultiscripts', 'mn', 'mo',
+  'mover', 'mpadded', 'mphantom', 'mroot', 'mrow', 'ms', 'mscarries',
+  'mscarry', 'msgroup', 'mstack', 'msline', 'mspace', 'msqrt', 'msrow',
+  'mstyle', 'msub', 'msup', 'msubsup', 'mtable', 'mtd', 'mtext', 'mtr',
+  'munder', 'munderover', 'semantics', 'annotation', 'annotation-xml',
+]
 
 export default withMermaid(
   defineConfig({
-    title: '从系统工具到操作系统',
-    description: '用 Zig 写真实项目，在做的过程中学操作系统',
+    title: '动手学操作系统',
+    description: '对照 Linux 内核源码学原理，用 Zig 写 Shell、内存数据库、加密文件系统和操作系统',
     lang: 'zh-CN',
     base: '/hands-on-os/',
 
     markdown: {
       config: (md) => {
+        md.use(mathjax3)
+
+        // Strip <style> tags from mathjax3 SVG output — they cause Vue compiler errors
+        const stripStyle = (html: string) => html.replace(/<style[\s\S]*?<\/style>/g, '')
+        const origInline = md.renderer.rules.math_inline!
+        const origBlock = md.renderer.rules.math_block!
+        md.renderer.rules.math_inline = (...args) => stripStyle(origInline(...args))
+        md.renderer.rules.math_block = (...args) => stripStyle(origBlock(...args))
+
         md.use(containerPlugin, 'expand', {
           render(tokens, idx) {
             const token = tokens[idx]
             if (token.nesting === 1) {
               const title = token.info.trim().slice('expand'.length).trim() || '拓展'
               return `<div class="expand custom-block"><p class="custom-block-title">${title}</p>\n`
+            }
+            return '</div>\n'
+          }
+        })
+        md.use(containerPlugin, 'practice', {
+          render(tokens, idx) {
+            const token = tokens[idx]
+            if (token.nesting === 1) {
+              const title = token.info.trim().slice('practice'.length).trim() || '动手实践'
+              return `<div class="practice custom-block"><p class="custom-block-title">${title}</p>\n`
             }
             return '</div>\n'
           }
@@ -33,6 +63,15 @@ export default withMermaid(
         })
       }
     },
+
+    vue: {
+      template: {
+        compilerOptions: {
+          isCustomElement: (tag) => mathjaxTags.includes(tag),
+        },
+      },
+    },
+
 
     themeConfig: {
       nav: [
@@ -122,18 +161,43 @@ export default withMermaid(
           ],
         },
         {
-          text: '从裸机到操作系统',
-          items: [
-            { text: '引导与内存', link: '/bare-metal/01-boot-memory' },
-            { text: '中断与进程', link: '/bare-metal/02-interrupt-process' },
-            { text: '系统调用与文件系统', link: '/bare-metal/03-syscall-filesystem' },
-            { text: '设备与网络', link: '/bare-metal/04-device-network' },
-          ],
-        },
-        {
           text: '可观测性',
           items: [
             { text: '性能分析与内核追踪', link: '/observability/01-perf-tracing' },
+          ],
+        },
+        {
+          text: 'zish：Shell',
+          items: [
+            { text: '基础 REPL', link: '/zish/01-repl' },
+            { text: 'Job Control', link: '/zish/02-job-control' },
+            { text: '隔离与移植', link: '/zish/03-isolation' },
+          ],
+        },
+        {
+          text: 'zedis：内存数据库',
+          items: [
+            { text: '事件循环与 RESP 协议', link: '/zedis/01-event-loop' },
+            { text: 'fork-COW 持久化', link: '/zedis/02-persistence' },
+            { text: 'TCP 服务器与 Socket 选项', link: '/zedis/03-networking' },
+            { text: '性能分析与优化', link: '/zedis/04-observability' },
+          ],
+        },
+        {
+          text: 'zcryptfs：加密文件系统',
+          items: [
+            { text: 'FUSE 用户态文件系统', link: '/zcryptfs/01-fuse-memfs' },
+            { text: '透明加密层', link: '/zcryptfs/02-encryption' },
+            { text: '崩溃一致性', link: '/zcryptfs/03-crash-safety' },
+          ],
+        },
+        {
+          text: 'zigos：裸机操作系统',
+          items: [
+            { text: '引导与内存', link: '/zigos/01-boot-memory' },
+            { text: '中断与进程', link: '/zigos/02-interrupt-process' },
+            { text: '系统调用与文件系统', link: '/zigos/03-syscall-filesystem' },
+            { text: '设备与网络', link: '/zigos/04-device-network' },
           ],
         },
       ],

@@ -1,6 +1,6 @@
 # 命名空间
 
-当我们运行一条命令，观察一个进程看到的世界：
+前面几课讲的进程都生活在同一个世界里——共享同一套 PID 编号、同一个文件系统、同一个网络栈。但容器技术需要让每个容器觉得自己独占一台机器。来看一个实验：运行一条命令，观察进程看到的世界：
 
 ```
 $ unshare --pid --fork --mount-proc bash
@@ -30,7 +30,7 @@ Linux 中这样的全局资源不止 PID 一种。挂载点列表、网络栈、
 | Cgroup | cgroup 根目录视图 | 4.6 (2016) |
 | Time | CLOCK_MONOTONIC、CLOCK_BOOTTIME | 5.6 (2020) |
 
-八种原理相同，本篇聚焦与构建容器直接相关的五种：**PID**（进程 ID 编号空间）、**Mount**（文件系统挂载点）、**Network**（网络栈）、**User**（用户 ID 与权限）、**UTS**（主机名）。剩余三种（IPC、Cgroup、Time）不展开。我们可以通过三个系统调用来操作 namespace：**clone** 在创建子进程时建立新 namespace，**unshare** 让当前进程脱离旧 namespace 进入新的，**setns** 加入一个已经存在的 namespace。最后看内核的 **nsproxy** 结构如何把一切串起来。
+八种原理相同，本篇聚焦与构建容器直接相关的五种：**PID** 隔离进程编号空间，**Mount** 隔离文件系统挂载点，**Network** 隔离网络栈，**User** 隔离用户 ID 与权限，**UTS** 隔离主机名。剩余三种（IPC、Cgroup、Time）不展开。知道了有哪些 namespace，下一个问题是怎么操作它们——内核提供三个系统调用：**clone** 在创建子进程时建立新 namespace，**unshare** 让当前进程脱离旧 namespace 进入新的，**setns** 加入一个已经存在的 namespace。最后看内核的 **nsproxy** 结构如何把一切串起来。
 
 ## PID
 
@@ -49,10 +49,7 @@ Namespace B:      1       bash calls getpid(), gets 1
 
 三个编号指向同一个进程。
 
-:::thinking
-
-> 为什么 OS 要允许多层 namespace 嵌套？
-
+:::thinking 为什么 OS 要允许多层 namespace 嵌套？
 假设不嵌套，所有进程共享一个 PID 空间。想想云平台的场景：平台、租户、租户的服务全在一个 namespace 里。租户运行 `ps aux`，能看到平台的数据库（PID 42）、别的租户的 Web 服务（PID 200）。执行 `kill 42`，平台数据库没了；执行 `kill 200`，别的租户的服务也没了。这不行。
 
 这就是**隔离**。每个租户只能看到自己的进程，看不到平台，也看不到别的租户。隔离需求可以递归：租户内部还想隔离自己的服务，服务内部还想隔离子任务，每一层组织边界对应一层 namespace。
@@ -205,9 +202,7 @@ User namespace 隔离用户 ID、组 ID 和 capabilities（能力）。
 
 User namespace 把 UID 和 capabilities 都变成 per-namespace 的：一个进程在自己的 User namespace 内部看到的 UID 是 0（root），但这个 0 映射到宿主机上可能是 UID 1000，一个普通用户。容器里的程序以为自己是 root，可以装软件、改配置，但如果它突破了容器边界，在宿主机上只有普通用户的权限。
 
-:::thinking
-
-> User namespace 和 PC 上的多用户（比如 Linux 上有多个账号）是同一个机制吗？
+:::thinking User namespace 和 PC 上的多用户（比如 Linux 上有多个账号）是同一个机制吗？
 
 不是。PC 多用户是传统的 Unix 用户系统：每个用户有一个 UID（你是 1000，另一个用户是 1001），所有用户共享同一个 UID 空间，内核根据 UID 判断谁能访问什么文件。这个机制从 Unix 诞生就有了，不涉及 namespace。User namespace 是在这个基础上再加一层：创建隔离的 UID 空间。同一个进程在 namespace 内部看到自己的 UID 是 0，但在宿主机上它的 UID 是 1000。多用户是「同一个空间里有不同的人」，User namespace 是「多个平行空间，同一个人在不同空间里有不同身份」。
 
