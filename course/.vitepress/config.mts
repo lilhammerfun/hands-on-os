@@ -128,7 +128,6 @@ export default withMermaid(
           items: [
             { text: 'Socket 与 TCP', link: '/network/01-socket-tcp' },
             { text: 'IPC 机制', link: '/network/02-ipc' },
-            { text: '高性能网络', link: '/network/03-high-performance-network' },
           ],
         },
         {
@@ -179,7 +178,7 @@ export default withMermaid(
           items: [
             { text: '事件循环与 RESP 协议', link: '/zedis/01-event-loop' },
             { text: 'fork-COW 持久化', link: '/zedis/02-persistence' },
-            { text: 'TCP 服务器与 Socket 选项', link: '/zedis/03-networking' },
+            { text: '网络调优与多线程', link: '/zedis/03-networking' },
             { text: '性能分析与优化', link: '/zedis/04-observability' },
           ],
         },

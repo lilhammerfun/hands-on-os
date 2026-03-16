@@ -26,6 +26,21 @@
   background-color: var(--vp-c-indigo-soft);
 }
 
+.custom-block.expand > p > img:first-child:last-child {
+  float: right;
+  width: 120px;
+  max-height: 160px;
+  object-fit: cover;
+  margin: 0 0 0.75em 1em;
+  border-radius: 0;
+}
+
+.custom-block.expand::after {
+  content: "";
+  display: block;
+  clear: both;
+}
+
 .custom-block.thinking {
   border-color: var(--vp-c-purple-soft);
   color: var(--vp-c-text-1);
