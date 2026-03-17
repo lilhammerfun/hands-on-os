@@ -127,6 +127,12 @@ course/.vitepress/dist/
 course/.vitepress/cache/
 bun.lock
 
+# === Build artifacts ===
+hello
+hello_pie
+page_table_size
+*.o
+
 # === Project specific ===
 .prompts/
 CLAUDE.md

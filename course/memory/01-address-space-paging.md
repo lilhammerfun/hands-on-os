@@ -10,29 +10,33 @@
 
 **编译时绑定**(compile-time binding)在编译阶段就确定程序使用的物理地址。编译器直接生成包含绝对物理地址的代码，因此程序只能加载到编译时预设的内存位置，否则所有地址都是错的。早期的 MS-DOS 程序和嵌入式系统固件就是这样工作的：编译器知道程序会被加载到固定地址（比如 0x0000），因此直接在代码中使用该地址。这种方式的局限性很明显：如果有两个程序都被编译为加载到地址 0x0000，它们就不能同时运行。
 
-用 `objdump` 可以看到编译后代码中的地址。先准备一个最简单的 C 程序：
+用 `objdump` 可以看到编译后代码中的地址[^1]。先准备一个最简单的 C 程序：
 
 <<< @/memory/code/hello.c
 
 ```bash
-# 编译为位置相关代码（模拟编译时绑定）
-$ gcc -no-pie -o hello hello.c
+# 默认编译即为位置相关代码
+$ gcc -o hello hello.c
 $ objdump -d hello | grep -A5 '<main>'
-0000000000401136 <main>:
-  401136:  55              push   %rbp
-  401137:  48 89 e5        mov    %rsp,%rbp
-  40113a:  bf 01 00 00 00  mov    $0x1,%edi
+0000000000401126 <main>:
+  401126:       55                      push   %rbp
+  401127:       48 89 e5                mov    %rsp,%rbp
+  40112a:       bf 04 20 40 00          mov    $0x402004,%edi
+  40112f:       e8 fc fe ff ff          call   401030 <puts@plt>
+  401134:       b8 00 00 00 00          mov    $0x0,%eax
 
-# 编译为位置无关代码（PIE，现代默认）
-$ gcc -pie -o hello_pie hello.c
+# 显式编译为位置无关代码（PIE）
+$ gcc -fPIE -pie -o hello_pie hello.c
 $ objdump -d hello_pie | grep -A5 '<main>'
-0000000000001149 <main>:
-    1149:  55              push   %rbp
-    114a:  48 89 e5        mov    %rsp,%rbp
-    114d:  bf 01 00 00 00  mov    $0x1,%edi
+0000000000001139 <main>:
+    1139:       55                      push   %rbp
+    113a:       48 89 e5                mov    %rsp,%rbp
+    113d:       48 8d 05 c0 0e 00 00    lea    0xec0(%rip),%rax
+    1144:       48 89 c7                mov    %rax,%rdi
+    1147:       e8 e4 fe ff ff          call   1030 <puts@plt>
 ```
 
-`-no-pie` 编译出的地址是 `0x401136`，这是一个固定的虚拟地址，因此程序必须被加载到这个位置。而 `-pie`（Position-Independent Executable，位置无关可执行文件）编译出的地址是 `0x1149`，这是一个相对偏移量，所以程序可以被加载到任意位置。
+默认编译出的 `main` 地址是 `0x401126`，这是一个固定的虚拟地址，因此程序必须被加载到这个位置。而加了 `-fPIE -pie`（Position-Independent Executable，位置无关可执行文件）后，`main` 的地址变成了 `0x1139`，这是一个相对偏移量，加载器可以把程序放到任意基址上。注意两者的寻址方式也不同：非 PIE 版本用绝对地址 `mov $0x402004,%edi` 引用字符串，PIE 版本用 `lea 0xec0(%rip),%rax` 相对于当前指令位置寻址，这样无论程序被加载到哪里，偏移量都是正确的。
 
 **加载时绑定**(load-time binding)在程序加载到内存时确定地址。编译器生成的代码使用相对地址（相对于程序起始位置的偏移量），加载器在把程序载入内存时，根据实际加载位置修正所有地址引用。这个修正过程叫重定位(relocation)。加载时绑定比编译时绑定灵活：同一个程序可以加载到不同的内存位置。但加载完成后，程序在运行期间不能再移动。如果操作系统想把一个正在运行的进程移到另一块物理内存（比如做内存紧凑），就必须重新修正所有地址，开销很大。
 
@@ -363,3 +367,5 @@ unsigned long phys = (pte_val(*pte) & PTE_PFN_MASK) | (vaddr & ~PAGE_MASK);
 - [`arch/x86/include/asm/pgtable_64_types.h`](https://elixir.bootlin.com/linux/latest/source/arch/x86/include/asm/pgtable_64_types.h) — 四/五级页表层级宏
 - [`arch/x86/mm/fault.c`](https://elixir.bootlin.com/linux/latest/source/arch/x86/mm/fault.c) — 缺页处理入口
 - [`mm/memory.c`](https://elixir.bootlin.com/linux/latest/source/mm/memory.c) — 页表操作核心函数
+
+[^1]: 本课的编译和反汇编输出基于 x86-64 Linux 环境（Docker 镜像 `gcc:14`，GCC 14.2，GNU binutils 2.43）。该环境下 GCC 默认生成位置相关代码（非 PIE），需要显式指定 `-fPIE -pie` 才能生成位置无关可执行文件。其他发行版（如 Ubuntu、Fedora）的 GCC 可能默认开启 PIE，输出地址会有所不同。

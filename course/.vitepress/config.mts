@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
 import { withMermaid } from 'vitepress-plugin-mermaid'
 import containerPlugin from 'markdown-it-container'
+import footnotePlugin from 'markdown-it-footnote'
 import mathjax3 from 'markdown-it-mathjax3'
 
 const mathjaxTags = [
@@ -23,6 +24,13 @@ export default withMermaid(
     markdown: {
       config: (md) => {
         md.use(mathjax3)
+        md.use(footnotePlugin)
+
+        // Render footnote references as plain superscript numbers (no brackets)
+        md.renderer.rules.footnote_ref = (tokens, idx) => {
+          const id = tokens[idx].meta.id + 1
+          return `<sup class="footnote-ref"><a href="#fn${id}" id="fnref${id}">${id}</a></sup>`
+        }
 
         // Strip <style> tags from mathjax3 SVG output — they cause Vue compiler errors
         const stripStyle = (html: string) => html.replace(/<style[\s\S]*?<\/style>/g, '')
