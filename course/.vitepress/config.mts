@@ -96,8 +96,10 @@ export default withMermaid(
         {
           text: '基础与概览',
           items: [
-            { text: '操作系统全景', link: '/basics/01-os-overview' },
-            { text: '系统调用与双模式', link: '/basics/02-syscall-dual-mode' },
+            { text: '操作系统与硬件', link: '/basics/01-os-overview' },
+            { text: '内核设计', link: '/basics/02-kernel-design' },
+            { text: '特权边界', link: '/basics/03-privilege-boundary' },
+            { text: '系统调用', link: '/basics/04-system-call' },
           ],
         },
         {
