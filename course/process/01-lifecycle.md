@@ -1,6 +1,12 @@
 # 进程生命周期
 
-从一个日常操作开始。当我们在终端输入 `ls -l` 并按回车，屏幕上出现文件列表。但 shell 本身是一个进程，它不能直接"变成" ls。进程模型决定了它需要三步：
+上一章讨论的核心边界是：用户程序怎样通过系统调用进入内核态。现在我们把镜头从"怎样越过边界"再往前推一步：当这条边界已经建立好之后，内核怎样把用户态世界真正拉起来，进程又怎样从创建一路走到退出？这正是进程管理这一章要回答的问题。
+
+机器启动后，内核不会直接执行 `ls` 这样的用户命令。它会先完成自身初始化，然后启动第一个用户态进程，也就是进程标识符(Process ID, PID) 为 1 的进程。这个进程继续把用户空间逐步建立起来：启动系统服务、准备登录环境、让 shell 出现在终端里等待输入。直到这时，我们敲下 `ls -l`，shell 才开始为这个命令创建和回收子进程。
+
+整条链路可以先记成：`kernel -> PID 1 -> 登录程序 -> shell -> ls`。
+
+当 shell 启动一个普通命令时，它不能直接"变成" `ls`。进程模型决定了它需要三步：
 
 1. 复制自己（fork）
 2. 让副本变成 ls（exec）
@@ -11,15 +17,17 @@ sequenceDiagram
     participant Shell as Shell (PID 100)
     participant Child as Child (PID 101)
 
-    Shell->>Child: fork() — clone self
-    Child->>Child: exec("ls") — replace with ls
+    Shell->>Child: fork(), clone self
+    Child->>Child: exec("ls"), replace with ls
     Child-->>Shell: exit()
-    Shell->>Shell: wait() — reap child, show next prompt
+    Shell->>Shell: wait(), reap child, show next prompt
 ```
 
-再看 `ls | grep .zig`，两个命令同时运行，ls 的输出直接流入 grep 的输入。连接它们的是**管道**，通过**文件描述符**重定向实现。
+再看 `ls | grep .zig`，两个命令同时运行，`ls` 的输出直接流入 `grep` 的输入。连接它们的是**文件描述符与管道**。
 
-这三步加上连接它们的机制，就是本篇的全部内容。先从**进程**本身开始——它是程序的运行实例，内核用 `task_struct` 记录它的全部状态。有了进程，就需要创建它：**fork** 复制当前进程，**exec** 把副本替换成新程序。子进程结束后必须被回收，否则会变成僵尸进程，这就是 **wait** 的作用。进程要和外界交互（读文件、写网络、连接管道），统一走**文件描述符**接口。两个进程的输入输出要串联起来，靠的是**管道**。
+这三步加上连接它们的机制，就是本篇的全部内容。先有**进程**这个管理单位，内核才能记录"谁在运行、谁是谁的父子、谁占了哪些资源"。系统要把用户空间拉起来，就必须先启动**第一个用户态进程**，也就是 PID 1。shell 自己也是普通进程，所以它要启动新命令，仍然要通过 **fork** 复制出一个子进程，再用 **exec** 把这个副本替换成目标程序。目标程序结束后，父进程必须用 **wait** 回收它，否则系统里就会留下僵尸。进程不仅要被创建和回收，还要接到终端、文件和其他进程上，这就引出了**文件描述符与管道**。
+
+这一章会沿着同一条主线继续往前走。本课先看单个进程怎样被创建、替换和回收。只要系统里同时存在多个进程，它们就会彼此打断，这就引出了**信号**。多个相关进程要作为一个整体和终端交互，于是有了**进程组与会话**。进程越来越多时，内核还必须决定谁先运行，这就是**CPU 调度**和 **Linux 调度器**要解决的问题。等"单个进程怎么活"和"多个进程怎么共存"都讲清楚之后，我们再进入**命名空间**和 **cgroups**，看 Linux 怎样隔离和限制整组进程。
 
 ## 进程
 
@@ -175,14 +183,41 @@ Low Address
 
 1. **保存/恢复寄存器**：把当前进程的通用寄存器、程序计数器、栈指针等保存到它的 `task_struct->thread`，再从下一个进程的 `task_struct->thread` 恢复。这部分由汇编代码 `__switch_to` 完成，本身很快，纳秒级。
 
-2. **切换页表**：把 CPU 的页表基址寄存器（x86 上是 CR3）指向新进程的页表。这会导致 TLB(Translation Lookaside Buffer) 失效——TLB 是 CPU 缓存的"虚拟地址 → 物理地址"映射，切换页表后这些缓存全部作废，后续每次内存访问都要重新查页表，直到 TLB 逐渐"暖"起来。
+2. **切换页表**：把 CPU 的页表基址寄存器（x86 上是 CR3）指向新进程的页表。这会导致 TLB(Translation Lookaside Buffer) 失效。TLB 是 CPU 缓存的"虚拟地址 → 物理地址"映射，切换页表后这些缓存全部作废，后续每次内存访问都要重新查页表，直到 TLB 逐渐"暖"起来。
 
 真正昂贵的不是寄存器保存那几十条指令，而是 TLB 失效和 CPU 缓存(L1/L2/L3)变冷带来的间接开销。新进程访问的数据大概率不在缓存里，要从主存重新加载。一次上下文切换的直接开销在微秒级（1-10μs），但缓存变冷导致的后续性能下降可能持续数百微秒。
 
-这就是为什么 Linux 的 CFS 调度器不会让时间片太短——切换太频繁，大量 CPU 时间浪费在"暖缓存"上，而不是执行真正的计算。
+这就是为什么 Linux 的 CFS 调度器不会让时间片太短。切换太频繁，大量 CPU 时间会浪费在"暖缓存"上，而不是执行真正的计算。
 :::
 
 僵尸进程(zombie process)是一个常见问题：进程已经死了，但 PCB 还占着内核内存，等父进程来收尸。如果父进程从不调用 `wait()`，僵尸会一直存在。这就是为什么 shell 必须正确回收子进程。
+
+## 第一个用户态进程
+
+第一个用户态进程是内核在完成自身初始化后启动的第一个运行在用户态的进程，它的 PID 固定为 1。
+
+这一步是系统从"只有内核"走向"用户空间开始运转"的分界线。内核已经完成了内存管理、调度器、设备驱动等基础准备，但如果它停在这里，系统里仍然没有任何登录程序、没有 shell、也没有后台服务。内核必须把控制权交给一个用户态进程，由它继续把剩下的用户空间拉起来。
+
+在现代 Linux 发行版中，这个 PID 1 通常是 `systemd`。历史上常见的是 SysV `init`，在容器里，PID 1 甚至可能就是应用程序本身。内核要求的是"系统里必须有一个 PID 1 来接住整个用户空间"，并不规定这个进程必须叫 `systemd`。
+
+在很多发行版里，你都可以直接看到这一点：
+
+```bash
+$ ps -p 1 -o pid,ppid,comm,args
+    PID    PPID COMMAND         COMMAND
+      1       0 systemd         /sbin/init
+```
+
+`PPID` 是父进程的 PID。这里 `PPID = 0`，表示 PID 1 不是某个普通用户态进程的子进程。它是内核启动用户空间时直接拉起来的第一个进程。
+
+shell 通常不是内核直接启动的。更常见的路径是：PID 1 先启动一个在终端上等待用户登录的程序，再由它执行密码验证程序，最后由密码验证程序执行 shell。于是 shell 只是进程树里较晚出现的一个普通节点，而不是用户空间的起点。
+
+```bash
+$ pstree -p
+systemd(1)---login(980)---bash(1024)---pstree(1103)
+```
+
+有了这个角色分工，PID 1 还会承担一个很重要的责任。系统里总会出现"父进程先退出，但子进程还活着"的情况。内核不能让这些进程失去管理者，所以它会把它们重新挂到 PID 1 名下。这样，无论原来的父进程是否还活着，系统里始终都有一个进程负责接住这些子进程，并在它们退出时完成最后的回收。
 
 ## fork
 
@@ -338,7 +373,7 @@ fork + exec 分离后，程序员可以在两者之间插入**任意系统调用
 const pid = try posix.fork();
 
 if (pid == 0) {
-    // between fork and exec — any syscall can be called here
+    // between fork and exec, any syscall can be called here
     // these calls modify the child's own state, not the parent's
 
     posix.close(posix.STDOUT_FILENO);                                    // close stdout
@@ -350,7 +385,7 @@ if (pid == 0) {
 }
 ```
 
-fork + exec 的分离，把"配置子进程"从一个函数的参数列表，变成了一段可以写任意代码的区间。任何系统调用都可以用来配置子进程，不需要 API 设计者预先考虑所有场景。这是 Unix 进程模型的核心设计决策。管道的实现也是这个原理（后文管道一节展开）。
+fork + exec 的分离，把"配置子进程"从一个函数的参数列表，变成了一段可以写任意代码的区间。任何系统调用都可以用来配置子进程，不需要 API 设计者预先考虑所有场景。这是 Unix 进程模型的核心设计决策。后文会看到，管道的实现也是这个原理。
 :::
 
 fork 和 exec 也可以独立使用。
@@ -373,7 +408,7 @@ export LOG_LEVEL="info"
 cd /opt/myapp
 
 # exec replaces the current shell process with the real application
-# from this line on, this shell script ceases to exist — PID unchanged, process becomes myapp
+# from this line on, this shell script ceases to exist, PID unchanged, process becomes myapp
 exec ./myapp --config production.toml
 ```
 
@@ -413,7 +448,7 @@ wait 做三件事：
 2. **获取退出状态**：父进程需要知道子进程是正常退出还是被信号杀死
 3. **同步**：shell 需要等命令执行完才显示下一个提示符
 
-如果父进程不调用 wait，子进程就一直是僵尸。如果父进程自己先退出了，子进程变成孤儿(orphan)，被 PID 1（init/systemd）收养，由 PID 1 负责 wait。
+如果父进程不调用 wait，子进程就一直是僵尸。这里可以回头看前面 PID 1 的意义：系统里必须始终有一个进程接住那些失去父进程的子进程。如果父进程自己先退出了，子进程就变成孤儿进程(orphan process)。内核会把它重新挂到 PID 1 名下，由 PID 1 在它退出时完成最后的回收。
 
 :::thinking waitpid 怎么跨进程等到子进程退出？
 关键在于：父子进程虽然各自独立，但它们的 `task_struct` 都在内核的同一块内存里。回看本篇开头的 `task_struct`，`parent` 指针和 `children` 链表维护着家族关系，`exit_code` 存放退出码，`__state` 记录进程状态。waitpid 的整个机制就建立在这些字段上。
@@ -444,9 +479,9 @@ do_waitpid(pid):
 两个进程确实像平行时空，但内核是这两个时空的上帝视角。它能同时看到所有 `task_struct`，在子进程退出时主动通知睡眠中的父进程。跨进程等待的本质不是父进程"穿越"到子进程，而是内核作为中间人，在一方退出时唤醒另一方。
 :::
 
-到这里，fork → exec → wait 三步走完了。进程的生命周期本身并不复杂。但进程之间怎么通信？shell 执行 `ls | grep foo` 时，ls 的输出怎么流到 grep 的输入？这就需要文件描述符和管道。
+到这里，fork → exec → wait 三步走完了。进程的生命周期本身并不复杂。但一个进程不仅要被创建和回收，还要接到终端、文件和其他进程上。shell 执行 `ls | grep foo` 时，`ls` 的输出怎么流到 `grep` 的输入？这就需要文件描述符和管道。
 
-## 文件描述符
+## 文件描述符与管道
 
 文件描述符(file descriptor, fd) 是进程访问文件、设备和管道的统一接口，即一个非负整数，作为进程文件描述符表的下标。
 
@@ -504,8 +539,6 @@ Parent fd table          Kernel file objects         Child fd table
 ```
 
 有了文件描述符和 fork 的交互规则，就可以理解管道的实现了。
-
-## 管道
 
 管道(pipe)是一个内核维护的单向字节缓冲区，通过两个文件描述符访问：一个只能写（写端），一个只能读（读端）。写端写入的数据在读端按相同顺序读出。
 
@@ -624,21 +657,22 @@ _ = linux.waitpid(pid2, &status2, 0);
 | 进程(Process) | 程序的运行实例，拥有独立的地址空间、文件描述符表、PCB |
 | PCB / `task_struct` | 内核为每个进程维护的数据结构，记录 PID、状态、寄存器、内存、文件等 |
 | 进程状态 | 就绪 → 运行 → 睡眠/僵尸，由调度器和系统调用驱动转换 |
+| 第一个用户态进程 | 内核完成初始化后启动的第一个用户态进程，PID 固定为 1，用来把用户空间继续拉起来 |
 | `fork()` | 复制当前进程，子进程返回 0，父进程返回子进程 PID |
 | Copy-on-Write | fork 只复制页表，写入时才复制物理页，fork+exec 几乎零开销 |
 | `exec()` | 用新程序替换当前进程的地址空间，成功后不返回 |
 | fork-exec 分离 | 把"配置子进程"从 API 参数变成一段可写任意代码的区间 |
-| `wait()` | 等待子进程结束，回收僵尸进程，读取退出状态 |
+| `wait()` | 等待子进程结束，回收僵尸进程，读取退出状态；孤儿进程最终由 PID 1 接手回收 |
 | 文件描述符(fd) | 非负整数，进程访问文件、设备和管道的统一接口 |
 | `dup2()` | 把一个 fd 槽位重定向到另一个 fd 指向的对象 |
 | 管道(pipe) | 内核维护的单向字节缓冲区，通过一对 fd（读端/写端）访问 |
 
-Shell 并不"运行"命令。它 fork 出自己的副本，在副本中配置好环境（重定向文件描述符、连接管道），然后 exec 成目标程序。fork 和 exec 的分离，把进程配置的自由度从 API 参数扩展到了任意代码。这是 Unix 进程模型最重要的设计决策。管道不是什么特殊的通信机制，它只是一个内核缓冲区加两个文件描述符，和 fork + dup2 组合后就实现了进程间的数据流。
+内核先把用户空间拉起来，shell 只是这棵进程树里较晚出现的一个普通进程。它并不"运行"命令，而是先 `fork()` 出自己的副本，在副本中配置好环境（重定向文件描述符、连接管道），再 `exec()` 成目标程序。子进程退出后，父进程用 `wait()` 回收它；如果父进程先退出，最后接手的是 PID 1。管道也不是什么特殊的通信机制，它只是一个内核缓冲区加两个文件描述符，和 `fork()` + `dup2()` 组合后就实现了进程间的数据流。
 
 ---
 
 **Linux 源码入口**：
-- [`kernel/fork.c`](https://elixir.bootlin.com/linux/latest/source/kernel/fork.c) — `copy_process()`：fork 的核心实现
-- [`fs/exec.c`](https://elixir.bootlin.com/linux/latest/source/fs/exec.c) — `do_execveat_common()`：exec 的核心实现
-- [`kernel/exit.c`](https://elixir.bootlin.com/linux/latest/source/kernel/exit.c) — `do_exit()` / `do_wait()`：退出与回收
-- [`fs/pipe.c`](https://elixir.bootlin.com/linux/latest/source/fs/pipe.c) — `do_pipe2()`：管道创建
+- [`kernel/fork.c`](https://elixir.bootlin.com/linux/latest/source/kernel/fork.c)：`copy_process()`，fork 的核心实现
+- [`fs/exec.c`](https://elixir.bootlin.com/linux/latest/source/fs/exec.c)：`do_execveat_common()`，exec 的核心实现
+- [`kernel/exit.c`](https://elixir.bootlin.com/linux/latest/source/kernel/exit.c)：`do_exit()` / `do_wait()`，退出与回收
+- [`fs/pipe.c`](https://elixir.bootlin.com/linux/latest/source/fs/pipe.c)：`do_pipe2()`，管道创建

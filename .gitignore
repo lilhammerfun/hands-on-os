@@ -136,6 +136,8 @@ page_table_size
 # === Project specific ===
 .prompts/
 CLAUDE.md
+AGENTS.md
+GEMINI.md
 .claude/
 .mcp.json
 others/
