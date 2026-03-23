@@ -2,8 +2,9 @@
   "name": "hands-on-os",
   "private": true,
   "scripts": {
-    "dev": "vitepress dev course",
-    "build": "vitepress build course",
+    "meta": "bun scripts/update-lesson-meta.mjs",
+    "dev": "bun run meta && vitepress dev course",
+    "build": "bun run meta && vitepress build course",
     "preview": "vitepress preview course"
   },
   "devDependencies": {
