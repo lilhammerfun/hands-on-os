@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process'
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '..')
-const targetDir = path.join(repoRoot, 'course', 'memory')
+const targetDir = path.join(repoRoot, 'course')
 const today = execFileSync('date', ['+%F'], {
   cwd: repoRoot,
   encoding: 'utf8',
@@ -14,6 +14,7 @@ const today = execFileSync('date', ['+%F'], {
 
 const metaPattern =
   /(^# .+\n\n)(?:- 协作者：`[^`\n]*`\n)?- 写作时间：`[^`\n]*`\n- 当前字符：`[^`\n]*`/m
+const headerPattern = /^# .+\n\n/
 
 function runGit(args, { allowFailure = false } = {}) {
   try {
@@ -49,7 +50,11 @@ function getDateText(relativePath, source) {
     .filter(Boolean)
 
   const created = history.at(-1) ?? today
-  const updated = hasWorkingTreeChanges(relativePath) ? today : history[0] ?? today
+  const needsInitialMeta = !metaPattern.test(source)
+  const updated =
+    hasWorkingTreeChanges(relativePath) || needsInitialMeta
+      ? today
+      : history[0] ?? today
 
   if (created === updated) return created
   return `${created} 首次提交，${updated} 最近修改`
@@ -66,15 +71,45 @@ function renderMetaBlock(dateText, charCount) {
   ].join('\n')
 }
 
-for (const entry of readdirSync(targetDir).sort()) {
-  if (!entry.endsWith('.md')) continue
+function collectMarkdownFiles(dir) {
+  const entries = readdirSync(dir).sort()
+  const files = []
 
-  const absolutePath = path.join(targetDir, entry)
+  for (const entry of entries) {
+    const absolutePath = path.join(dir, entry)
+    const stats = statSync(absolutePath)
+
+    if (stats.isDirectory()) {
+      files.push(...collectMarkdownFiles(absolutePath))
+      continue
+    }
+
+    if (!entry.endsWith('.md')) continue
+    files.push(absolutePath)
+  }
+
+  return files
+}
+
+function applyMetaBlock(source, dateText, charCount) {
+  const renderedMeta = renderMetaBlock(dateText, charCount)
+
+  if (metaPattern.test(source)) {
+    return source.replace(metaPattern, `$1${renderedMeta}`)
+  }
+
+  if (headerPattern.test(source)) {
+    return source.replace(headerPattern, (header) => `${header}${renderedMeta}\n\n`)
+  }
+
+  return source
+}
+
+for (const absolutePath of collectMarkdownFiles(targetDir)) {
   const relativePath = path.relative(repoRoot, absolutePath)
   const source = readFileSync(absolutePath, 'utf8')
-  const match = source.match(metaPattern)
 
-  if (!match) continue
+  if (!metaPattern.test(source) && !headerPattern.test(source)) continue
 
   const dateText = getDateText(relativePath, source)
 
@@ -82,19 +117,13 @@ for (const entry of readdirSync(targetDir).sort()) {
   let rendered = source
 
   for (let i = 0; i < 8; i += 1) {
-    rendered = source.replace(
-      metaPattern,
-      `$1${renderMetaBlock(dateText, charCount)}`
-    )
+    rendered = applyMetaBlock(source, dateText, charCount)
     const next = countCharacters(rendered)
     if (next === charCount) break
     charCount = next
   }
 
-  rendered = source.replace(
-    metaPattern,
-    `$1${renderMetaBlock(dateText, charCount)}`
-  )
+  rendered = applyMetaBlock(source, dateText, charCount)
 
   writeFileSync(absolutePath, rendered)
 }
