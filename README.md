@@ -4,7 +4,7 @@
 
 ## 在线阅读
 
-https://lilhammerfun.codeberg.page/hands-on-os/
+https://lilhammerfun.github.io/hands-on-os/
 
 ## License
 
