@@ -129,7 +129,7 @@ export default withMermaid(
           items: [
             { text: '地址空间', link: '/memory/01-address-space' },
             { text: '分页与多级页表', link: '/memory/02-paging' },
-            { text: '虚拟内存', link: '/memory/03-virtual-memory' },
+            { text: '页面回收与交换', link: '/memory/03-page-reclaim' },
             { text: '内存映射', link: '/memory/04-memory-mapping' },
             { text: '内核内存分配', link: '/memory/05-kernel-memory' },
           ],
