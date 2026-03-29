@@ -127,10 +127,11 @@ export default withMermaid(
         {
           text: '内存管理',
           items: [
-            { text: '地址空间与分页', link: '/memory/01-address-space-paging' },
-            { text: '虚拟内存', link: '/memory/02-virtual-memory' },
-            { text: '内存映射', link: '/memory/03-memory-mapping' },
-            { text: '内核内存分配', link: '/memory/04-kernel-memory' },
+            { text: '地址空间', link: '/memory/01-address-space' },
+            { text: '分页与多级页表', link: '/memory/02-paging' },
+            { text: '虚拟内存', link: '/memory/03-virtual-memory' },
+            { text: '内存映射', link: '/memory/04-memory-mapping' },
+            { text: '内核内存分配', link: '/memory/05-kernel-memory' },
           ],
         },
         {
