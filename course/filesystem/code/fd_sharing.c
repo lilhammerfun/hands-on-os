@@ -15,6 +15,7 @@ int main(void) {
         char buf[6] = {0};
         read(fd, buf, 5);
         printf("[fork]  child read: \"%s\"\n", buf);
+        fflush(stdout);
         close(fd);
         _exit(0);
     }
