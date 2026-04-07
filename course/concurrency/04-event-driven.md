@@ -230,38 +230,71 @@ Kegel 的文章系统地分析了各种 I/O 策略，其中重点推荐了基于
 
 ## 事件循环
 
-事件循环(event loop)是一种编程模式：单个线程在循环中调用 `epoll_wait()`（或类似的多路复用 API）等待事件，收到事件后分发给对应的回调函数处理，处理完毕后返回继续等待。
+事件循环(event loop)是一种编程模式：单个线程在循环中调用 `epoll_wait()`（或类似的多路复用 API）等待事件，收到事件后分发给对应的处理逻辑，处理完毕后返回继续等待。
 
-事件循环的骨架代码：
+上一节的 echo_epoll.c 其实已经是一个完整的事件循环，但当时我们聚焦在 epoll 的 API 上，没有从事件循环的角度分析它。现在回头看这段代码的主循环，把三个 epoll API 的调用时机串成一条线。一个新连接从建立到被服务的完整生命周期是这样的：
 
-```c
-while (running) {
-    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);  // 阻塞等待事件
-    for (int i = 0; i < n; i++) {
-        handler_t handler = lookup(events[i].data.fd);  // 找到该 fd 注册的回调
-        handler(&events[i]);                             // 执行回调
-    }
-}
+```
+初始化阶段（程序启动时执行一次）：
+  epfd = epoll_create1(0)             ← 创建 epoll 实例，返回一个 fd 指向它
+  epoll_ctl(epfd, ADD, server_fd)     ← 把监听 socket 注册进这个 epoll 实例
+
+主循环（反复执行）：
+  ┌→ epoll_wait(epfd, events, ...)    ← 阻塞，等待任何已注册的 fd 有事件
+  │    │
+  │    │  返回就绪的 fd 列表，逐个处理：
+  │    │
+  │    ├─ 就绪的是 server_fd？                     ← "有新连接到达"
+  │    │    client_fd = accept(server_fd)           ← 接受连接
+  │    │    set_nonblocking(client_fd)
+  │    │    epoll_ctl(epfd, ADD, client_fd)         ← 把新连接注册进 epoll
+  │    │
+  │    └─ 就绪的是 client_fd？                     ← "某个客户端发了数据"
+  │         n = read(client_fd, buf, ...)           ← 读数据
+  │         write(client_fd, buf, n)                ← 回显
+  │
+  └─ 所有就绪 fd 处理完毕，回到 epoll_wait
 ```
 
-这个模式有一条核心约束：**回调必须非阻塞**。事件循环是单线程的，如果一个回调执行了阻塞操作（比如读数据库、请求外部 API），整个循环就停在这里，所有其他 fd 的事件都得不到处理。在 thread-per-connection 模型中，一个线程阻塞只影响一个连接；在事件循环中，一个回调阻塞影响所有连接。
+`epoll_create1()` 只在程序启动时调用一次。`epoll_ctl()` 在两个时机被调用：启动时注册监听 socket，以及每次 accept 新连接后注册客户端 socket。`epoll_wait()` 在主循环的每一轮开头调用，阻塞直到至少一个已注册的 fd 有事件。
 
-这引出了事件驱动与多线程模型的本质区别。多线程是抢占式并发(preemptive concurrency)：操作系统调度器决定何时切换线程，线程可以在任意时刻被中断。事件循环是协作式并发(cooperative concurrency)：每个回调主动让出控制权（通过返回），循环才能继续处理下一个事件。抢占式并发需要锁来保护共享状态，协作式并发天然不需要锁，因为同一时刻只有一个回调在执行。但协作的前提是每个参与者都遵守"不阻塞"的约定。
+所谓"回调"，就是 `epoll_wait()` 返回后、针对每个就绪 fd 执行的那段处理逻辑。在 echo_epoll.c 中，回调是 `for` 循环体里的 `if/else`：如果就绪的是 server_fd 就走 accept 路径，如果是 client_fd 就走 read/write 路径。在更大的系统（如 Redis、Nginx）中，回调通常被封装成函数指针，通过 `events[i].data.ptr` 携带——但本质上做的事和这段 `if/else` 一样：根据 fd 的类型执行对应的处理。
+
+这个模式有一条核心约束：**回调必须非阻塞**。来看一个具体的场景。假设这不是 echo server，而是一个 HTTP 服务器。客户端发来一个请求 `GET /user/42`，回调需要查数据库拿到用户信息后返回。如果回调直接调用 `mysql_query()`，会发生什么？
+
+```
+epoll_wait 返回：client_fd=8 可读
+  → 回调开始处理 fd=8
+    → read(8, buf, ...) 读到 "GET /user/42"
+    → mysql_query("SELECT * FROM users WHERE id=42")
+      → 底层：connect() + write() 发 SQL + read() 等结果
+      → read() 阻塞在 MySQL socket 的等待队列上……
+
+      此时 client_fd=5 的数据到了，但没人调 epoll_wait
+      client_fd=12 的数据也到了，同样没人处理
+      整个服务器卡住了，直到 MySQL 返回结果
+```
+
+在 thread-per-connection 模型中，一个线程阻塞只影响它负责的那一个连接，其他线程继续工作。但在事件循环中，只有一个线程，一个回调阻塞就意味着整个循环停转，所有连接都得不到处理。
+
+真实系统怎么解决这个问题？把阻塞操作卸载给工作线程池。回调本身不做阻塞操作，而是把任务丢给后台线程，线程完成后通过 fd（比如 `eventfd` 或管道）通知事件循环"结果好了"，事件循环在下一轮 `epoll_wait` 中收到通知，再把结果发回客户端。Nginx 的 `thread_pool` 指令、Node.js 的 libuv 线程池都是这个模式。核心原则不变：事件循环线程本身永远不阻塞。
+
+这引出了事件驱动与多线程模型的本质区别。多线程是抢占式并发(preemptive concurrency)：操作系统调度器决定何时切换线程，线程可以在任意时刻被中断。事件循环是协作式并发(cooperative concurrency)：每个回调主动让出控制权（通过返回），循环才能继续处理下一个事件。抢占式并发需要锁来保护共享状态，协作式并发天然不需要锁，因为同一时刻只有一个回调在执行。但协作的前提是每个参与者都遵守"不阻塞"的约定——一个行为不端的回调就能拖垮整个服务器。
 
 ```mermaid
 sequenceDiagram
     participant EL as 事件循环
     participant EP as epoll
-    participant H1 as 回调 A
-    participant H2 as 回调 B
+    participant H1 as 处理 fd=5（read/write）
+    participant H2 as 处理 fd=8（read/write）
 
     EL->>EP: epoll_wait()
     Note over EL,EP: 阻塞，等待事件
     EP-->>EL: fd=5 可读, fd=8 可读
-    EL->>H1: 处理 fd=5
-    H1-->>EL: 返回
-    EL->>H2: 处理 fd=8
-    H2-->>EL: 返回
+    EL->>H1: read(5) → write(5)
+    H1-->>EL: 返回（非阻塞，微秒级）
+    EL->>H2: read(8) → write(8)
+    H2-->>EL: 返回（非阻塞，微秒级）
     EL->>EP: epoll_wait()
     Note over EL,EP: 继续等待下一批事件
 ```
