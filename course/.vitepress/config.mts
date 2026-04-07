@@ -108,6 +108,7 @@ export default withMermaid(
             { text: '进程生命周期', link: '/process/01-lifecycle' },
             { text: '信号', link: '/process/02-signal' },
             { text: '进程组与会话', link: '/process/03-process-group' },
+            { text: '伪终端', link: '/process/04-pty' },
             { text: 'CPU 调度', link: '/process/04-scheduling' },
             { text: 'Linux 调度器', link: '/process/05-linux-scheduler' },
             { text: '命名空间', link: '/process/06-namespace' },
