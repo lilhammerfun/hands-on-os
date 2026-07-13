@@ -1,476 +1,329 @@
 # 内核同步机制
 
-- 写作时间：`2026-03-04 首次提交，2026-03-23 最近修改`
-- 当前字符：`18861`
+- 写作时间：`2026-03-04 首次提交，2026-07-13 最近修改`
+- 当前字符：`12627`
 
-事件驱动一课展示了一种避免并发复杂度的思路：用单线程消除共享状态。但内核本身不能选择单线程。内核在所有 CPU 上同时运行，随时被硬件中断打断，管理着全系统共享的数据结构。同步原语一课讲过的 spinlock 和 mutex 是起点，但内核面对的约束远比用户态复杂。
+[事件驱动并发](/concurrency/04-event-driven)通过明确状态归属，让少量线程可以管理大量等待。但内核不能只面对一种执行流：用户进程进入系统调用时会执行内核代码，内核线程可与其他执行流并发，设备发出的硬件中断还可能暂停当前代码并转去执行中断处理函数。同一份内核数据因而可能被不同入口、不同 CPU 同时访问。
 
-来看一个具体场景。一个内核开发者写了一个设备驱动，用 `spin_lock()` 保护一个共享计数器。测试环境中一切正常。但在生产环境中，一个硬件中断在持锁期间触发了。中断处理函数也需要访问这个计数器，于是调用 `spin_lock()` 尝试获取同一把锁。问题来了：锁的持有者是被中断打断的那段代码，它在中断返回之前不可能恢复执行；中断处理函数在拿到锁之前也不会返回。在单个 CPU 上，没有其他线程参与，死锁就这样发生了。
+来看一个驱动中的队列。进程正在持锁修改队列时，本 CPU 收到硬件中断；中断处理函数也要获取同一把锁。若进程只调用普通 `spin_lock()`，本地中断仍可发生。中断处理函数会一直自旋等待，而真正持锁的代码只有等中断返回后才能继续，单个 CPU 上便形成自死锁。这里不是缺少一把更强的锁，而是加锁前没有先判断代码可能在哪种环境中运行。
 
-```c
-#include <linux/spinlock.h>
-#include <linux/interrupt.h>
+因此，本课先用 **执行上下文**确定代码能否睡眠、能被谁打断。不能睡眠的临界区使用 **内核自旋锁**，允许睡眠的进程上下文可以选择 **内核互斥量**。读多写少、可以整体复制的数据若允许读者重试，可以改用 **顺序锁**；共享对象的指针与回收时机需要同时管理时，则进入 **RCU**。如果共享本身不是必需的，**Per-CPU 变量**把写入拆到各 CPU 的独立副本。最后，线程并非总在争夺数据，有时只是等待另一项工作到达某个里程碑，这由 **完成变量**表达。
 
-static DEFINE_SPINLOCK(counter_lock);
-static int counter = 0;
+## 执行上下文
 
-// 中断处理函数
-static irqreturn_t my_irq_handler(int irq, void *dev) {
-    spin_lock(&counter_lock);     // 尝试获取锁，但锁已被下面的代码持有
-    counter++;                     // 永远执行不到
-    spin_unlock(&counter_lock);
-    return IRQ_HANDLED;
-}
+执行上下文(execution context)是内核代码当前由哪类活动触发，以及这种活动对抢占、中断和睡眠施加哪些约束。
 
-// 进程上下文代码
-void update_counter(void) {
-    spin_lock(&counter_lock);     // 获取锁
-    counter++;                     // ← 此时中断触发，CPU 跳转到 my_irq_handler
-    spin_unlock(&counter_lock);   // 永远执行不到
-}
-```
+这里的“睡眠”不是 CPU 进入低功耗状态，而是当前任务把自己放入等待状态，让调度器选择其他任务运行。睡眠要求存在一个可被调度器管理的任务，等待条件满足后再把这个任务唤醒。因此，能否睡眠不是函数自身的固定属性，还取决于调用它时所处的上下文。
 
-这个场景揭示了内核并发的特殊约束。当中断上下文参与时，加锁必须同时控制中断，这就是 **内核自旋锁** 家族。对于可以睡眠的进程上下文代码，**内核互斥量** 提供了更好的选择。对于读远多于写的数据，**顺序锁** 让读者完全不阻塞写者。进一步地，**RCU** 让读的开销降到近零，靠延迟内存回收实现。当共享可以完全消除时，**Per-CPU 变量与完成变量** 从根本上绕过了同步问题。
+内核中最常见的三类上下文如下：
+
+| 上下文 | 触发方式 | 能否主动睡眠 | 典型约束 |
+|--------|----------|--------------|----------|
+| 进程上下文 | 系统调用处理或内核线程 | 通常可以 | 禁用抢占、关闭中断或持有自旋锁后不能睡眠 |
+| 硬中断上下文 | 设备向 CPU 发出中断请求 | 不可以 | 必须尽快处理并返回被打断的位置 |
+| 软中断上下文 | 内核延后执行的一类中断工作 | 不可以 | 可在多个 CPU 并行，也可能被硬中断打断 |
+
+进程上下文代表某个任务执行。内核可用 `current` 找到这个任务，允许它加入等待队列并由调度器切换出去。但“正在进程上下文”仍不等于“此刻一定能睡眠”：代码一旦关闭本地中断、禁用抢占或持有普通自旋锁，就进入了不能主动调度的区间。
+
+硬中断处理函数不是一个可以独立加入等待队列的调度实体。它借用当前 CPU 立即执行，并必须完成后返回被打断的代码。即使 `current` 仍能指向被打断的任务，也不能把中断处理函数当成该任务的一段普通可睡眠代码。软中断同样运行在不可睡眠的环境中，只是触发和执行时机与硬中断不同。
+
+原子上下文(atomic context)是对所有“不能主动睡眠”区间的统称。硬中断、软中断、关闭中断的代码、禁用抢占的代码和持有自旋锁的临界区都属于这一类。这里的 atomic 强调调度约束，不表示临界区内的多条指令自动成为一个硬件原子操作。
+
+选择同步原语时，第一个问题因此不是“临界区有几行”，而是“等待这把锁时是否允许睡眠”。若答案是否定的，只能使用不会让当前执行流睡眠的原语；若答案是肯定的，才有资格在自旋锁和睡眠锁之间继续比较竞争、持有时间与调度成本。
 
 ## 内核自旋锁
 
-内核自旋锁(kernel spinlock)是 Linux 内核中最基础的锁原语，等待者原地自旋直到锁可用，同时可以选择性地关闭中断或下半部来防止中断上下文导致的死锁。
+内核自旋锁(kernel spinlock)是等待者持续检查锁状态而不主动睡眠的互斥原语，适用于不可睡眠的执行上下文和受严格约束的短临界区。
 
-同步原语一课讲过 spinlock 的基本原理：CAS + 自旋 + `cpu_relax()`。内核 spinlock 在此基础上增加了一个维度：中断控制。
+在普通未启用完全抢占实时配置(PREEMPT_RT)的内核中，`spin_lock()` 获取锁时会禁止当前任务在本 CPU 上被抢占，但不会关闭本地硬中断。这样可以防止任务持锁后被同一 CPU 上的另一任务抢占，却不能阻止开篇中的中断处理函数重入同一临界区。
 
-回到开篇的死锁场景。`update_counter()` 持有 `counter_lock` 时被中断打断，`my_irq_handler()` 在同一个 CPU 上尝试获取同一把锁。这不是死锁一课分析过的 ABBA 死锁（多线程交叉锁序），而是单 CPU 上的自死锁：一个执行流持有锁，另一个执行流在同一个 CPU 上尝试获取同一把锁，而前者在后者返回之前不可能恢复执行。
-
-关键在于理解两种执行上下文。进程上下文(process context)是内核代表某个用户进程执行代码时的状态，比如系统调用处理、内核线程执行。进程上下文可以调用 `schedule()` 让出 CPU，也可以被中断打断。中断上下文(interrupt context)是 CPU 响应硬件中断后执行中断处理函数时的状态。中断上下文有两个硬性约束：不能调用 `schedule()`（因为没有进程上下文可以切换回来），并且不能被同类型或更低优先级的中断打断（在同一个 CPU 上）。
-
-理解了这两种上下文，就能看清为什么纯 `spin_lock()` 在开篇场景中会死锁：`spin_lock()` 只做自旋，不控制中断。进程上下文代码持有锁时，中断照常触发，中断处理函数试图获取同一把锁，自旋永远等不到释放。
-
-Linux 内核提供了四个 spinlock 变体来应对不同的中断场景：
+如果同一份数据会被进程上下文和硬中断上下文访问，进程侧必须在持锁前关闭本 CPU 的硬中断。最稳妥的常见写法是保存原中断状态：
 
 ```c
-// 变体 1：不控制中断，仅自旋
-spin_lock(&lock);
-spin_unlock(&lock);
+static DEFINE_SPINLOCK(queue_lock);
 
-// 变体 2：关闭本地 CPU 的所有硬件中断 + 自旋
-spin_lock_irq(&lock);
-spin_unlock_irq(&lock);
-
-// 变体 3：保存当前中断状态，关闭中断 + 自旋（解锁时恢复原状态）
-unsigned long flags;
-spin_lock_irqsave(&lock, flags);
-spin_unlock_irqrestore(&lock, flags);
-
-// 变体 4：关闭本地 CPU 的软中断（下半部）+ 自旋
-spin_lock_bh(&lock);
-spin_unlock_bh(&lock);
-```
-
-这四个变体的选择取决于临界区可能被什么打断。如果临界区只在进程上下文中使用，不涉及任何中断处理函数，用 `spin_lock()` 就够了。如果临界区的数据同时被硬件中断处理函数访问，就需要 `spin_lock_irq()` 或 `spin_lock_irqsave()` 在加锁的同时关闭中断。两者的区别是：`spin_lock_irq()` 假设加锁前中断是开启的，解锁时无条件开启中断；`spin_lock_irqsave()` 先保存当前的中断状态（中断可能已经被更外层的代码关闭了），解锁时恢复到保存的状态。如果不确定加锁时中断是否已经被关闭，用 `spin_lock_irqsave()` 更安全。如果临界区的数据被软中断(softirq，Linux 内核中用于延迟执行中断处理中不紧急工作的下半部(bottom half)机制)访问，用 `spin_lock_bh()`，它只关闭软中断，不关闭硬件中断。
-
-用 `spin_lock_irqsave()` 修复开篇的死锁代码：
-
-```c
-void update_counter(void) {
+void update_queue(struct item *item)
+{
     unsigned long flags;
-    spin_lock_irqsave(&counter_lock, flags);  // 关闭中断 + 获取锁
-    counter++;
-    spin_unlock_irqrestore(&counter_lock, flags);  // 释放锁 + 恢复中断状态
+
+    spin_lock_irqsave(&queue_lock, flags);
+    add_item(item);
+    spin_unlock_irqrestore(&queue_lock, flags);
 }
 ```
 
-加锁时中断被关闭了，`my_irq_handler()` 在锁持有期间不会在这个 CPU 上触发，死锁消失了。中断会在 `spin_unlock_irqrestore()` 恢复中断后才被响应。
+`spin_lock_irqsave()` 先把当前本地中断状态写入 `flags`，再关闭本地硬中断并获取锁；解锁接口先释放锁，再恢复保存的状态。若外层代码本来已经关闭中断，恢复后仍保持关闭，而不是错误地把中断打开。
 
-死锁一课介绍了 lockdep 的核心机制：锁类、依赖图和环检测。lockdep 还有一个重要能力：中断上下文的安全性验证。lockdep 跟踪每个锁类在哪些上下文中被使用过。如果一个锁在进程上下文中用 `spin_lock()` 获取（不关中断），又在硬件中断上下文中被获取，lockdep 会立刻报告一个锁序违规，即使死锁在测试中从未真正发生。
+不同后缀控制的是本 CPU 上哪些执行入口可以重入：
 
-```
-=================================
-WARNING: inconsistent lock state
----------------------------------
-inconsistent {HARDIRQ-ON-W} -> {IN-HARDIRQ-W} usage.
-swapper/1 took:
- (&counter_lock){....}, at: my_irq_handler+0x10/0x30
-{HARDIRQ-ON-W} state was registered at:
- lock_acquire+0x80/0x100
- update_counter+0x20/0x50
-```
+| 接口 | 本地附加约束 | 适用前提 |
+|------|--------------|----------|
+| `spin_lock()` | 禁止抢占 | 数据不会从本地硬中断或软中断重入，或调用点已经处理这些入口 |
+| `spin_lock_bh()` | 禁止抢占并关闭软中断处理 | 数据同时由进程上下文和软中断访问 |
+| `spin_lock_irq()` | 关闭本地硬中断 | 已知进入前硬中断处于开启状态 |
+| `spin_lock_irqsave()` | 保存并关闭本地硬中断 | 调用点原有中断状态不确定，解锁时需要准确恢复 |
 
-这条告警的含义是：`counter_lock` 曾经在硬件中断开启的状态下被获取（`HARDIRQ-ON-W`），现在又在硬件中断处理函数内被获取（`IN-HARDIRQ-W`）。lockdep 检测到这两种使用模式组合起来就可能导致开篇演示的那种死锁。不需要死锁真正发生，不需要特定的线程交错，只要锁的使用模式不一致，lockdep 就能提前报警。这就是死锁一课提到的"lockdep 实现细节"在中断维度上的体现：lockdep 不仅跟踪锁之间的获取顺序（环检测），还跟踪每个锁类的中断上下文注解，确保同一把锁不会在"中断开启的进程上下文"和"中断上下文"中同时使用。
+关闭本地中断只影响当前 CPU。其他 CPU 仍可到达同一数据，因此它们还要通过自旋锁互斥。反过来，自旋锁只解决 CPU 之间的同时访问；只有 `_bh`、`_irq` 或 `_irqsave` 变体才解决本 CPU 被相应中断入口重入的问题。这两个作用必须同时理解。
 
-:::thinking 为什么中断上下文不能睡眠？
+持有自旋锁期间不能调用可能睡眠的函数。若持锁者睡眠，其他 CPU 会持续自旋消耗处理器，而且调度与唤醒路径本身还可能需要当前上下文禁止的操作。临界区还应保持有界，避免复制大量数据、等待设备或执行无法预估次数的循环。是否改用 mutex 不应靠固定的指令数决定，而应先检查上下文合法性，再用实际竞争和延迟数据判断。
 
-中断打断了某个正在运行的进程（或内核线程），CPU 从进程上下文切换到中断上下文。此时被打断的进程仍然处于 `TASK_RUNNING` 状态，它的上下文（寄存器、栈指针）保存在栈上，等待中断返回后恢复执行。
+[死锁](/concurrency/03-deadlock)介绍过的 lockdep 也会验证内核锁的中断用法。lockdep 是运行时锁正确性验证器：它把遵循同一规则的锁实例归为锁类，记录已经执行过的获取顺序，并记录锁类是否在硬中断、软中断开启或关闭的环境中出现。若某个锁类既可在硬中断中获取，又曾在本地硬中断开启时由可被打断的路径获取，lockdep 可以根据这两段已观察事实报告潜在自死锁。它不要求危险时序真的发生，但也看不到测试从未执行的路径，因此不能替代锁规则审查。
 
-如果中断处理函数调用了 `schedule()`，调度器会选择另一个进程来运行。但被打断的进程还在等中断返回才能恢复执行，而中断处理函数已经让出了 CPU，不会继续执行到返回。被打断的进程就永远卡住了。
+:::expand PREEMPT_RT 中的自旋锁
 
-更根本的原因是：`schedule()` 切换的是进程上下文。中断上下文不属于任何进程，它没有自己的 `task_struct` 可以被调度器管理。让一个不属于任何进程的执行流去调用"切换到另一个进程"的函数，在语义上就不成立。
+PREEMPT_RT 配置以更强的实时抢占能力为目标，会改变 `spinlock_t` 的实现语义。普通内核中 `spinlock_t` 映射到 `raw_spinlock_t`，获取后禁止抢占；PREEMPT_RT 中的 `spinlock_t` 建立在实时 mutex 机制上，等待者可能阻塞，任务保持不可迁移，但仍可被抢占。`_irq` 和 `_irqsave` 后缀也不再按普通内核方式改变硬中断状态。
 
-这就是为什么中断上下文只能使用 spinlock 而不能使用 mutex。mutex 在拿不到锁时会调用 `schedule()` 让当前进程睡眠，而中断上下文不能睡眠。spinlock 拿不到锁时只是自旋（在原地循环），不涉及进程切换，所以在中断上下文中是安全的。
-:::
-
-:::expand ticket spinlock 与 queued spinlock
-
-同步原语一课展示的 spinlock 实现是最简单的 test-and-set 模型：所有等待者不断对同一个变量做 CAS。这个模型有一个公平性问题：哪个核心先 CAS 成功完全靠运气，后来的等待者可能比先到的更早拿到锁，产生饥饿。
-
-ticket spinlock 引入了排队机制。锁内部维护两个计数器：`next`（下一个待发号码）和 `owner`（当前叫到的号码）。加锁时原子地取一个号（`ticket = atomic_fetch_add(&lock->next, 1)`），然后自旋等待 `lock->owner == ticket`。解锁时把 `owner` 加一，叫下一个号。这保证了严格的 FIFO 顺序。
-
-```c
-// ticket spinlock (simplified)
-typedef struct {
-    atomic_t next;   // 待发号码
-    atomic_t owner;  // 当前叫到的号码
-} ticket_spinlock_t;
-
-void ticket_spin_lock(ticket_spinlock_t *lock) {
-    int ticket = atomic_fetch_add(&lock->next, 1);
-    while (atomic_read(&lock->owner) != ticket)
-        cpu_relax();
-}
-
-void ticket_spin_unlock(ticket_spinlock_t *lock) {
-    atomic_inc(&lock->owner);
-}
-```
-
-ticket spinlock 解决了公平性问题，但在多核系统上有缓存行争用的问题：所有核心都在自旋读同一个 `owner` 变量，这个变量每次解锁都会被修改，导致所有核心的缓存行同时失效，产生大量缓存一致性流量（线程一课讲过的 MESI 协议中的 Invalid 状态迁移）。核心越多，争用越严重。
-
-Linux 从 4.2 版本开始使用 queued spinlock（基于 MCS 锁的变体）。MCS 锁的核心思想是：每个等待者自旋在自己的局部变量上，而不是共享变量上。每个核心有一个本地节点，节点通过链表连起来。解锁时只修改下一个等待者的局部变量，不会导致所有核心的缓存行失效。这把缓存一致性流量从 O(n) 降低到了 O(1)。
-
-queued spinlock 的实现在 `kernel/locking/qspinlock.c`，它在 MCS 锁的基础上做了进一步优化，把整个锁压缩到一个 32 位整数中（`locked` + `pending` + `tail` 三个字段），减少了内存开销。
+真正必须在硬中断等原子上下文中保持非睡眠语义的底层代码使用 `raw_spinlock_t`。这一区别说明“spinlock 一定只会忙等”不是跨所有内核配置都成立的接口结论。正文其余部分讨论的是常见非 PREEMPT_RT 语义，阅读实时内核代码时必须重新核对锁类型。
 :::
 
 ## 内核互斥量
 
-内核互斥量(kernel mutex)是 Linux 内核中的睡眠锁，等待者在获取不到锁时让出 CPU 进入睡眠，锁释放时被唤醒，只能在进程上下文中使用。
+内核互斥量(kernel mutex)是由 `struct mutex` 表示的睡眠锁，竞争失败的任务可以进入等待队列，因此只能在允许睡眠的进程上下文中获取。
 
-同步原语一课讲过 mutex 的基本结构：锁变量 + 等待队列 + CAS 快速路径 + 睡眠慢速路径。内核 mutex 在此基础上做了一个重要的优化：在快速路径和慢速路径之间插入了一条中间路径。
+mutex 与自旋锁保护的目标相同，都是让临界区一次只由一个执行流进入；差别在等待策略。无竞争时，mutex 通过原子操作把 owner 从空值改为当前任务，直接走快速路径。有竞争时，Linux 不一定立即睡眠：若持有者正在 CPU 上运行，而且当前任务不需要调度，等待者可以短暂进行乐观自旋，期待持有者很快解锁。内核用队列限制同时竞争的自旋者，避免所有等待者反复修改同一锁状态。
 
-内核 `struct mutex` 的获取有三条路径：
+若继续自旋不合适，任务进入慢速路径，加入 mutex 的等待队列并睡眠；解锁路径再唤醒等待者。因此 `struct mutex` 在语义上仍是睡眠锁，乐观自旋只是减少短暂竞争下调度开销的内部优化，不能据此把 mutex 用进硬中断、软中断或其他原子上下文。
 
-```c
-// kernel/locking/mutex.c (simplified)
-void __sched mutex_lock(struct mutex *lock) {
-    // 路径 1：快速路径 — 一次 CAS
-    if (atomic_try_cmpxchg(&lock->owner, 0, current))
-        return;  // 锁空闲，直接获取
+mutex 的基本规则包括：
 
-    // 路径 2：中间路径 — optimistic spinning
-    if (mutex_optimistic_spin(lock))
-        return;  // 自旋等到了锁
+| 规则 | 原因 |
+|------|------|
+| 只能由持有者解锁 | owner 表示具体任务，跨任务解锁会破坏所有权 |
+| 不支持递归获取 | 同一任务再次获取自己持有的普通 mutex 会自死锁 |
+| 不能在中断上下文获取 | 竞争路径可能睡眠 |
+| 不能在持有自旋锁时获取 | mutex 睡眠会违反外层原子上下文约束 |
+| 释放前要恢复共享不变量 | 解锁只建立互斥边界，不会替代码修复半更新状态 |
 
-    // 路径 3：慢速路径 — 加入等待队列，睡眠
-    list_add_tail(&waiter.list, &lock->wait_list);
-    set_current_state(TASK_UNINTERRUPTIBLE);
-    schedule();
-}
-```
+`mutex_lock()` 默认进行不可中断等待；`mutex_lock_interruptible()` 允许信号中断等待，并通过返回值告诉调用者是否真正取得锁；`mutex_trylock()` 不等待，只报告本次是否成功。后两者都会引入额外控制路径，代码必须只在成功取得锁后访问临界区，并在每条退出路径正确解锁。
 
-路径 1 是无竞争的快速路径，和同步原语一课介绍的完全相同：一次 CAS 尝试，成功则返回。路径 3 是有竞争的慢速路径：把当前线程加入等待队列并调用 `schedule()` 让出 CPU。路径 2 是同步原语一课提到过的 optimistic spinning（乐观自旋）的具体实现。它的判断逻辑是：如果锁的当前持有者正在某个 CPU 上运行（通过 `owner->on_cpu` 字段判断），等待者就不睡眠，而是自旋等待。理由是持有者正在执行，很可能马上就会释放锁，自旋几圈的开销比 `schedule()` 的上下文切换开销更低。只有当持有者被调度走了（不在任何 CPU 上运行），等待者才放弃自旋，进入睡眠。
+自旋锁与 mutex 的选择可以归结为下面的顺序：
 
-mutex 和 spinlock 的选择取决于两个因素。第一是执行上下文：中断上下文不能使用 mutex（因为 mutex 会调用 `schedule()`），只能用 spinlock。第二是临界区长度：如果临界区很短（几条指令），spinlock 的自旋开销比 mutex 的上下文切换开销更低；如果临界区较长（涉及内存分配、文件操作等可能阻塞的操作），spinlock 会让等待者长时间空转浪费 CPU，应该用 mutex。一个简单的判断标准是：如果临界区内的代码可能睡眠（调用任何可能阻塞的函数），必须用 mutex，因为 spinlock 持有期间不允许睡眠。
+1. 若调用路径可能位于硬中断、软中断或其他原子上下文，排除 mutex。
+2. 若临界区内需要调用允许睡眠的接口，例如可能阻塞的内存分配或设备操作，排除普通自旋锁。
+3. 两者都合法时，再根据持锁时间、竞争概率、CPU 数量和调度延迟进行测量，而不是套用固定时长阈值。
 
-```c
-// 使用 mutex 的典型场景：进程上下文，临界区可能阻塞
-struct mutex my_mutex;
-mutex_init(&my_mutex);
-
-void my_function(void) {
-    mutex_lock(&my_mutex);
-    buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);  // 可能睡眠
-    // ... 操作 buffer ...
-    kfree(buffer);
-    mutex_unlock(&my_mutex);
-}
-```
-
-`kmalloc()` 带 `GFP_KERNEL` 标志时可能触发内存回收而睡眠，所以这个临界区不能用 spinlock 保护。
-
-:::thinking 内核 mutex 的 optimistic spinning 是怎么工作的？
-
-optimistic spinning 面临一个实际问题：多个等待者同时自旋在同一个 mutex 上时，它们都在不断检查 `lock->owner` 是否释放，这和 ticket spinlock 面临的缓存行争用问题一样。
-
-Linux 内核的 mutex 使用了 OSQ(Optimistic Spin Queue)来解决这个问题，OSQ 本质上是 MCS 锁的一个变体。每个等待者在一个 per-CPU 的节点上自旋，而不是在共享的 `lock->owner` 上自旋。等待者们排成一个队列，只有队列头部的等待者监视锁的持有者状态，其余等待者自旋在自己的局部节点上。
-
-```c
-// kernel/locking/osq_lock.c (simplified)
-bool osq_lock(struct optimistic_spin_queue *lock) {
-    node = this_cpu_ptr(&osq_node);
-    prev = atomic_xchg(&lock->tail, node);
-    if (prev == NULL)
-        return true;  // 队列为空，直接获取
-
-    prev->next = node;
-    while (!node->locked)  // 自旋在自己的局部节点上
-        cpu_relax();
-    return true;
-}
-```
-
-当锁被释放时，只有队列头部的等待者的节点被标记为 `locked`，它获取锁后修改下一个节点的状态。整个过程中，每个核心只自旋在自己的缓存行上，解锁时只影响一个核心的缓存行，避免了"所有核心同时失效"的问题。
-
-这就是为什么同步原语一课说 optimistic spinning"非常有效"：它不是简单地在 `lock->owner` 上忙等，而是通过 MCS 队列把缓存行争用降到了最低。
-:::
+调试配置中的 `might_sleep()` 检查可以在原子上下文走到潜在睡眠点时发出诊断，lockdep 则继续检查 mutex 与其他锁之间的依赖顺序。前者发现上下文违规，后者发现锁关系违规；两类工具覆盖的问题不同。
 
 ## 顺序锁
 
-顺序锁(seqlock, sequential lock)是一种读写锁变体，写者永远不被阻塞，读者通过检测序列计数器来判断读取是否被写者干扰，如果被干扰则重试。
+顺序锁(seqlock)是把序列计数器与写者自旋锁组合起来的同步原语，写者彼此互斥，而读者不加锁地复制数据并在版本变化时重试。
 
-同步原语一课的读写锁让多个读者并发、写者独占。但读写锁有一个问题：如果读者持续存在，写者可能一直等不到所有读者离开，产生写者饥饿。顺序锁的思路相反：写者优先级最高，写者随时可以修改数据，读者负责检测并重试。
-
-顺序锁的核心是一个序列计数器(sequence counter)。写者在修改数据前把计数器加一（变成奇数），修改完成后再加一（变回偶数）。读者在读取前记录计数器的值，读取完成后再次检查：如果计数器的值变了，或者是奇数（表示写者正在修改），就说明读到的数据可能不一致，必须重试。
+序列计数器(sequence counter)是这套机制的核心。没有写者时，计数值为偶数；写者开始修改前把它变成奇数，修改完成后再变回下一个偶数。读者先取得起始值，复制整组数据，再检查结束时的计数：起始值为偶数且前后相同，才表示这份副本没有跨过写入过程。
 
 ```c
-// include/linux/seqlock.h (simplified)
-typedef struct {
-    unsigned sequence;       // 序列计数器
-    spinlock_t lock;         // 保护写者之间的互斥
-} seqlock_t;
+struct clock_snapshot {
+    u64 seconds;
+    u32 nanoseconds;
+};
 
-// 写者
-void write_seqlock(seqlock_t *sl) {
-    spin_lock(&sl->lock);           // 写者之间互斥
-    sl->sequence++;                  // 计数器变为奇数：写入开始
-    smp_wmb();                       // 写屏障：保证计数器递增在数据修改之前可见
+static DEFINE_SEQLOCK(clock_lock);
+static struct clock_snapshot clock_state;
+
+void update_clock(u64 seconds, u32 nanoseconds)
+{
+    write_seqlock(&clock_lock);
+    clock_state.seconds = seconds;
+    clock_state.nanoseconds = nanoseconds;
+    write_sequnlock(&clock_lock);
 }
 
-void write_sequnlock(seqlock_t *sl) {
-    smp_wmb();                       // 写屏障：保证数据修改在计数器递增之前可见
-    sl->sequence++;                  // 计数器变为偶数：写入结束
-    spin_unlock(&sl->lock);
-}
+struct clock_snapshot read_clock(void)
+{
+    struct clock_snapshot copy;
+    unsigned int seq;
 
-// 读者
-unsigned read_seqbegin(const seqlock_t *sl) {
-    unsigned seq;
     do {
-        seq = READ_ONCE(sl->sequence);
-    } while (seq & 1);              // 奇数表示写者正在写，等待
-    smp_rmb();                       // 读屏障
-    return seq;
-}
+        seq = read_seqbegin(&clock_lock);
+        copy.seconds = READ_ONCE(clock_state.seconds);
+        copy.nanoseconds = READ_ONCE(clock_state.nanoseconds);
+    } while (read_seqretry(&clock_lock, seq));
 
-int read_seqretry(const seqlock_t *sl, unsigned start) {
-    smp_rmb();                       // 读屏障
-    return sl->sequence != start;   // 计数器变了，说明中间有写者修改过
+    return copy;
 }
 ```
 
-读者的使用模式是一个 do-while 循环：
+`read_seqbegin()` 与 `read_seqretry()` 包含这套协议需要的编译器和 CPU 内存顺序约束，不能用两个普通变量读取随意替换。读者还必须在循环内先复制到局部变量，验证成功后再使用；如果验证失败，此轮读到的所有字段都应丢弃。
 
-```c
-unsigned seq;
-do {
-    seq = read_seqbegin(&my_seqlock);
-    // 读取共享数据到局部变量
-    local_copy = shared_data;
-} while (read_seqretry(&my_seqlock, seq));
-// 使用 local_copy（此时保证一致性）
-```
+裸 `seqcount_t` 只维护计数，不会阻止两个写者同时进入。调用者必须用外部锁串行化写者，并保证写侧临界区不可被会执行读侧代码的上下文抢占。`seqlock_t` 内嵌一个 `spinlock_t`，自动完成写者互斥和普通抢占保护；若读者可能来自硬中断或软中断，写侧还要使用对应的 `_irqsave` 或 `_bh` 变体，避免写者停在奇数状态时被读者打断并让读者持续重试。
 
-Linux 内核中顺序锁的典型使用场景是时间子系统。`jiffies`（内核的节拍计数器）和 `xtime`（墙钟时间）就用 seqlock 保护。时钟中断处理函数作为写者更新时间，频率固定（通常 100-1000 Hz）。系统中大量代码需要读取当前时间，读者远多于写者。用 mutex 或 rwlock 保护会让读者之间互相阻塞或阻塞写者，而 seqlock 让读者完全不阻塞写者，写者也不需要等待任何读者。
+顺序锁不会让写者等待普通无锁读者，但写者仍会等待其他写者。读者也不是保证一次成功：写入频繁或写侧临界区过长时，读者可能反复重试甚至饥饿。因此它适合写入少、读取快，并且数据可以廉价复制的场景。
 
-顺序锁有一个重要的限制：读者不能在重试循环中对共享数据做解引用。如果共享数据包含指针，读者在读取指针后、解引用之前，写者可能已经释放了指针指向的内存。读者拿着一个悬垂指针(dangling pointer)去解引用，就会访问已释放的内存。所以 seqlock 只适合保护简单的值类型数据（整数、时间戳、坐标等），不适合保护包含指针的数据结构。
-
-:::expand 内核抢占(Kernel Preemption)
-
-内核抢占(kernel preemption)是指内核态执行的代码可以被调度器打断，让另一个更高优先级的进程运行。在不可抢占的内核中，一旦 CPU 进入内核态（比如执行系统调用），只有内核代码主动调用 `schedule()` 或者从系统调用返回用户态时，调度器才有机会切换进程。
-
-但 Linux 是可抢占的内核。`CONFIG_PREEMPT` 编译选项开启后，内核代码在几乎任何地方都可以被抢占（除了持有 spinlock 或禁用了抢占的区间）。这意味着一段内核代码正在访问 per-CPU 数据时，可能被抢占并调度到另一个 CPU 上继续执行，此时它访问的 per-CPU 数据就不再是原来那个 CPU 的了。
-
-所以在可抢占内核中，访问 per-CPU 数据时必须禁用抢占。`get_cpu_var()` 宏会先调用 `preempt_disable()` 禁用抢占，`put_cpu_var()` 再调用 `preempt_enable()` 恢复抢占。`spin_lock()` 在可抢占内核上也会隐式禁用抢占，因为持有 spinlock 期间如果被抢占，其他 CPU 上的线程尝试获取同一把锁时就会长时间自旋。
-
-抢占计数器 `preempt_count` 记录在每个线程的 `thread_info` 结构中，是一个整数。`preempt_disable()` 使计数器加一，`preempt_enable()` 减一。只有计数器为零时，调度器才允许抢占。spinlock 的加锁和解锁也会修改这个计数器。
-:::
+顺序锁通常不适合保护可能被写者释放或失效的指针。读者取得指针后，尚未执行结束校验，写者就可能让目标对象失效；即使读者随后发现版本变化，危险的解引用已经发生。顺序计数只能判断快照是否一致，不能延长对象生命周期。需要无锁读取指针结构并推迟回收时，必须使用能管理生命周期的机制。
 
 ## RCU
 
-RCU(Read-Copy-Update)是一种同步机制，允许读者在完全无锁、无原子操作、无内存屏障的情况下访问共享数据，写者通过复制旧数据、修改副本、替换指针的方式更新数据，并在所有读者完成读取后才回收旧数据。
+读-复制-更新(Read-Copy-Update, RCU)是面向读多写少指针结构的同步机制，它允许读者访问仍然有效的旧版本，同时把更新拆成发布或移除与延迟回收两个阶段。
 
-从 spinlock 到读写锁再到 seqlock，每一步都在降低读端的代价。spinlock 让读写都付出自旋的代价。同步原语一课介绍的读写锁让读者之间不互斥，但读者仍然需要原子操作来修改读者计数器。seqlock 让读者完全不阻塞写者，但读者仍然需要读取序列计数器和执行内存屏障。RCU 把读的开销降到了极致：读者只需要调用 `rcu_read_lock()` 和 `rcu_read_unlock()`，它们在非抢占式内核上编译为空操作，在可抢占内核上仅仅是禁用和启用抢占。没有锁获取，没有原子操作，没有内存屏障。
+顺序锁让读者在冲突时重试，却不能保护已经失效的对象。RCU 改变的是对象回收时机：更新者可以立即让新读者不再看到旧对象，但必须等待所有可能仍持有旧引用的读者离开后，才能释放旧对象。这个等待区间称为宽限期(grace period)。
 
-RCU 的核心思想可以分解为三个部分：发布-订阅(publish-subscribe)、读侧临界区和宽限期。
+一条典型 RCU 路径包含三个协议：
 
-**发布-订阅**。写者更新一个共享指针时，必须保证读者要么看到旧指针，要么看到新指针，不能看到一个"半更新"的指针值。`rcu_assign_pointer()` 是写者的发布操作，它包含一个写内存屏障，保证新数据结构的所有字段在指针更新之前对其他 CPU 可见。`rcu_dereference()` 是读者的订阅操作，它包含一个数据依赖屏障（在某些弱内存模型架构上需要），保证通过指针访问的数据是最新的。
+1. 读者在 `rcu_read_lock()` 与 `rcu_read_unlock()` 之间取得并使用 RCU 指针。
+2. 更新者初始化新对象，再用 RCU 发布接口替换指针，或把旧对象从结构中摘除。
+3. 更新者等待一个宽限期，或注册宽限期结束后的回调，然后才回收旧对象。
 
-```c
-// 写者：发布新数据
-struct my_data *new = kmalloc(sizeof(*new), GFP_KERNEL);
-new->value = 42;
-rcu_assign_pointer(global_ptr, new);  // 包含 smp_wmb()
-
-// 读者：订阅
-rcu_read_lock();
-struct my_data *p = rcu_dereference(global_ptr);  // 包含数据依赖屏障
-if (p)
-    use(p->value);  // 保证看到 value = 42
-rcu_read_unlock();
-```
-
-**读侧临界区**。`rcu_read_lock()` 和 `rcu_read_unlock()` 标记了 RCU 读侧临界区(RCU read-side critical section)的边界。在这个区间内，读者持有对共享数据的引用，写者不能回收旧数据。读侧临界区内不能睡眠（和中断上下文的约束类似），因为睡眠会阻塞宽限期的检测。
-
-**宽限期**。写者替换了指针之后，旧数据不能立刻释放，因为可能还有读者在 `rcu_read_lock()` 和 `rcu_read_unlock()` 之间持有旧指针。宽限期(grace period)是指从写者替换指针开始，到所有在替换之前进入读侧临界区的读者都退出为止的这段时间。宽限期结束后，不可能再有读者持有旧指针，旧数据可以安全释放。
-
-写者有两种方式等待宽限期。`synchronize_rcu()` 是同步方式：阻塞当前进程直到宽限期结束，然后返回，写者接着释放旧数据。`call_rcu()` 是异步方式：注册一个回调函数，宽限期结束后由 RCU 子系统调用这个回调来释放旧数据，写者不需要等待。
-
-下面是 RCU 保护链表的完整示例。链表是 RCU 最常见的使用场景，Linux 内核中有大量用 RCU 保护的链表（路由表、进程列表、文件系统挂载点列表等）：
+下面的配置指针示例展示了这三个阶段：
 
 ```c
-struct my_entry {
-    int data;
-    struct list_head list;
-    struct rcu_head rcu;     // 用于 call_rcu 的回调
+struct config {
+    int limit;
 };
 
-static LIST_HEAD(my_list);
-static DEFINE_SPINLOCK(my_list_lock);  // 保护写者之间的互斥
+static struct config __rcu *active_config;
+static DEFINE_MUTEX(config_lock);
 
-// 读者：遍历链表，无锁
-void reader(void) {
-    struct my_entry *entry;
+int read_limit(void)
+{
+    struct config *config;
+    int limit;
+
     rcu_read_lock();
-    list_for_each_entry_rcu(entry, &my_list, list) {
-        process(entry->data);
-    }
+    config = rcu_dereference(active_config);
+    limit = config ? READ_ONCE(config->limit) : 0;
     rcu_read_unlock();
+
+    return limit;
 }
 
-// 写者：添加节点
-void add_entry(int data) {
-    struct my_entry *new = kmalloc(sizeof(*new), GFP_KERNEL);
-    new->data = data;
-    spin_lock(&my_list_lock);
-    list_add_rcu(&new->list, &my_list);    // 包含 rcu_assign_pointer
-    spin_unlock(&my_list_lock);
-}
+void replace_config(struct config *new_config)
+{
+    struct config *old_config;
 
-// 回调函数：宽限期结束后释放旧节点
-static void free_entry_rcu(struct rcu_head *rcu) {
-    struct my_entry *entry = container_of(rcu, struct my_entry, rcu);
-    kfree(entry);
-}
+    mutex_lock(&config_lock);
+    old_config = rcu_dereference_protected(
+        active_config, lockdep_is_held(&config_lock));
+    rcu_assign_pointer(active_config, new_config);
+    mutex_unlock(&config_lock);
 
-// 写者：删除节点
-void remove_entry(struct my_entry *entry) {
-    spin_lock(&my_list_lock);
-    list_del_rcu(&entry->list);            // 从链表中摘除
-    spin_unlock(&my_list_lock);
-    call_rcu(&entry->rcu, free_entry_rcu); // 注册回调，宽限期后释放
+    synchronize_rcu();
+    kfree(old_config);
 }
 ```
 
-注意写者之间仍然需要 spinlock 互斥（两个写者同时修改链表会破坏链表结构），但读者完全不需要任何锁。这就是 RCU 的精髓：读端零开销，写端承担复制和等待宽限期的代价。在读多写少的场景下，这种取舍非常划算。
+`rcu_assign_pointer()` 不只写入一个地址，还保证新对象的初始化在指针对其他 CPU 可见前完成。`rcu_dereference()` 读取受 RCU 保护的指针，并保留随后解引用所需的编译器和硬件顺序。普通赋值与普通指针读取缺少这些协议含义，也会绕过内核的静态检查。
 
-:::thinking RCU 的宽限期怎么确定结束？
+示例把已经发布的 `struct config` 当作不可原地修改的对象，并用 `config_lock` 串行化多个更新者。RCU 只保证读者所引用的旧对象在宽限期前不会被回收，不会自动阻止两个写者同时修改结构，也不会让任意原地字段更新成为一致快照。需要原地更新时，还要为相应字段建立锁、原子操作或其他明确协议。
 
-宽限期的核心问题是：如何确定所有在替换指针之前进入读侧临界区的读者都已经退出？
+宽限期等待的是“发布或移除动作发生前已经进入、因而可能取得旧引用的相关读侧临界区”结束，不是等待系统中永远不再出现读者。更新协议必须先撤销从共享结构到旧对象的入口，再开始等待；此后按当前结构查找的读者不会通过该入口新取得旧对象。读者若要在 `rcu_read_unlock()` 之后继续保存对象，必须在临界区内取得引用计数或使用其他生命周期协议，不能只把裸指针带出去。
 
-RCU 引入了静止状态(quiescent state)的概念。当一个 CPU 经过一次上下文切换、执行了用户态代码、或者进入了空闲循环(idle loop)，就认为它经过了一个静止状态。关键的推理是：`rcu_read_lock()` 和 `rcu_read_unlock()` 之间不能发生上下文切换（因为不能睡眠），所以一个 CPU 一旦经过了上下文切换，就意味着它之前的所有读侧临界区一定已经结束了。
+静止状态(quiescent state)是 RCU 用来证明某个 CPU 不再处于旧读侧临界区的可观察状态。非抢占式 RCU 可以利用上下文切换、进入用户态或进入空闲状态等事件报告静止状态。可抢占 RCU 允许读侧临界区被调度器抢占，但仍不允许读者主动执行会阻塞的操作；若读者被抢占，Tree RCU 会跟踪对应任务，直到其最外层 `rcu_read_unlock()` 完成。因而“每个 CPU 都切换过一次”只是理解宽限期的起点，不是覆盖所有内核配置的完整算法。
 
-宽限期的结束条件是：所有 CPU 都经过了至少一次静止状态。当这个条件满足时，可以确定没有任何 CPU 上还存在替换指针之前进入的读侧临界区。
+Tree RCU 用分层的 `rcu_node` 结构汇总 CPU 和被抢占读者的状态，避免所有 CPU 直接竞争一个全局计数器。`synchronize_rcu()` 让当前更新者睡眠等待宽限期；`call_rcu()` 注册回调，让更新者先继续执行，回调在宽限期后处理回收。前者控制流直观但会等待，后者适合不能同步等待或希望批量回收的路径。
 
-`synchronize_rcu()` 的实现就是等待所有 CPU 经过静止状态。Linux 内核的 Tree RCU（`kernel/rcu/tree.c`）用一棵分层的树结构来高效地聚合各 CPU 的静止状态报告。每个 CPU 向叶子节点报告自己的静止状态，叶子节点向父节点汇聚，直到根节点确认所有 CPU 都经过了静止状态，宽限期结束。
+RCU 读侧通常不获取互斥锁、不写全局共享计数，也不与其他读者争用同一缓存行，因此开销很低。但“低开销”不等于在所有配置、调试选项和 RCU 类型下都编译为空操作。更新者还要承担对象复制或摘除、写者互斥、宽限期跟踪和延迟回收的成本，所以 RCU 适合经过设计的读多写少结构，不是通用的无锁替代品。
 
-这个设计的巧妙之处在于：它把"确认所有读者完成"这个全局问题，转化为了"确认所有 CPU 经过了上下文切换"这个局部可观测的事件。不需要读者显式地注册或注销，不需要全局计数器，只需要观察 CPU 的调度行为。这也是 RCU 读端零开销的根本原因：读者什么都不需要做（不需要修改任何共享变量），宽限期的检测完全由 RCU 基础设施在后台完成。
+:::expand SRCU
+
+可睡眠 RCU(Sleepable RCU, SRCU)是允许读侧临界区主动睡眠的一种 RCU 类型。读者通过 `srcu_read_lock()` 取得索引，并在 `srcu_read_unlock()` 时交还；`synchronize_srcu()` 根据显式读者状态等待宽限期，而不是把普通 RCU 的调度约束直接套用过来。
+
+这种能力会增加读侧记账和每个 SRCU 域的管理成本。只有读者确实需要跨越可睡眠操作时才应选择 SRCU；普通 RCU、SRCU 和其他 RCU 类型的读锁与宽限期接口不能随意混用。
 :::
 
-:::expand Paul McKenney
+## Per-CPU 变量
 
-Paul E. McKenney 是 RCU 机制在 Linux 内核中的主要设计者和维护者。他在 IBM Linux Technology Center 工作超过 20 年，专注于并行编程和 RCU 的研究与实现。他主导了 Linux 内核中多个 RCU 版本的开发，包括 Classic RCU、Tree RCU 和 Tiny RCU。他撰写的 *Is Parallel Programming Hard, And, If So, What Can You Do About It?* 是并行编程领域的经典参考书，可在线免费阅读。他目前在 Meta 工作，继续维护 Linux 内核的 RCU 子系统。
-:::
+每 CPU 变量(per-CPU variable)是为每个可能的 CPU 分配独立副本的数据，使本地更新不必争用同一个全局存储位置。
 
-## Per-CPU 变量与完成变量
-
-Per-CPU 变量(per-CPU variable)是为每个 CPU 核心分配独立副本的变量，各 CPU 只访问自己的副本，从根本上消除了共享和同步的需要。完成变量(completion)是一种轻量级的一次性事件通知机制，让一个线程等待另一个线程完成某项工作。
-
-线程一课介绍了线程本地存储(TLS)：每个线程拥有变量的独立副本，通过 `threadlocal` 关键字（或 C 的 `__thread`）声明，编译器把 TLS 变量放到 `.tdata`/`.tbss` 段，访问时通过 FS 段寄存器做相对寻址。Per-CPU 变量是 TLS 在内核中的对应物，但两者的设计动机有一个关键区别。TLS 的目的是隔离线程的私有数据（比如 `errno`），Per-CPU 变量的主要目的是消除同步开销：如果每个 CPU 只读写自己的副本，就不存在跨 CPU 的数据争用，线程一课讲过的伪共享问题也不会发生，同时也不需要任何锁。
+[线程](/concurrency/01-thread)介绍的 TLS 按线程保存副本，Per-CPU 变量则按 CPU 保存副本。它的主要目标不是为任务保密，而是把频繁写入分散开：CPU 0 更新自己的计数，CPU 1 更新另一份计数，两者就不需要反复争夺同一缓存行的写权限。
 
 ```c
-// include/linux/percpu.h
-// 定义 per-CPU 变量
-DEFINE_PER_CPU(int, my_counter);
+DEFINE_PER_CPU(unsigned long, packet_count);
 
-// 访问 per-CPU 变量
-void increment_counter(void) {
-    get_cpu_var(my_counter)++;    // 禁用抢占 + 获取当前 CPU 的副本
-    put_cpu_var(my_counter);       // 恢复抢占
+void account_packet(void)
+{
+    this_cpu_inc(packet_count);
 }
+```
 
-// 跨 CPU 汇总
-int total_count(void) {
-    int total = 0;
+`this_cpu_inc()` 把“选择当前 CPU 副本”和“递增”组合为一个本地操作，不需要先取得全局锁。任务可能在这条操作之前或之后迁移，所以单个 CPU 的计数不一定代表某个固定任务的历史；但每次递增都会落入某个 CPU 的有效副本，所有副本之和仍保留总次数。
+
+若代码需要取得本地副本指针并连续执行多步操作，就必须在整个区间防止迁移。`get_cpu_ptr()` 会禁止抢占并返回当前 CPU 的副本，`put_cpu_ptr()` 在结束时恢复抢占。单独调用 `this_cpu_ptr()` 取得的指针，也只能在调用者已经保证不会迁移的区间安全使用；抢占恢复后继续保存这个指针，可能操作错误 CPU 的副本。
+
+Per-CPU 只消除了不同 CPU 对同一副本的常规争用，不会自动处理本 CPU 上进程上下文与中断上下文的重入。如果两者会用多步读改写访问同一副本，仍要选择适合该上下文的本地中断控制或原子操作。其他 CPU 直接写远端 CPU 的副本也属于例外路径，可能破坏 `this_cpu_*` 所依赖的本地更新假设。
+
+汇总同样有代价：
+
+```c
+unsigned long total_packets(void)
+{
+    unsigned long total = 0;
     int cpu;
+
     for_each_possible_cpu(cpu)
-        total += per_cpu(my_counter, cpu);
+        total += per_cpu(packet_count, cpu);
+
     return total;
 }
 ```
 
-`get_cpu_var()` 宏在返回当前 CPU 副本的指针之前，会先调用 `preempt_disable()` 禁用内核抢占。原因是：如果一段代码正在修改 CPU 0 的 `my_counter`，此时被抢占并迁移到 CPU 1 上继续执行，它接下来修改的就是 CPU 1 的 `my_counter`，而 CPU 0 的更新只做了一半。禁用抢占保证了在访问 per-CPU 变量期间，当前线程不会被迁移到其他 CPU。`put_cpu_var()` 恢复抢占。
+如果各 CPU 正在并发更新，这个结果通常只是逐项读取期间的近似快照，不保证对应某个单一时刻。统计接口可以接受近似值时，这种取舍很合适；若调用者要求严格一致的总数，就要增加冻结、版本校验或其他同步协议，不能因为数据叫 Per-CPU 就省略一致性定义。
 
-Per-CPU 变量的典型使用场景包括：统计计数器（网络子系统中每个 CPU 独立计数发包和收包数量，需要总数时再汇总）、内核调度器的 per-CPU 运行队列（`struct rq`，每个 CPU 维护自己的就绪进程队列，避免全局队列的锁争用），以及 slab 分配器的 per-CPU 缓存（每个 CPU 维护自己的空闲对象链表，分配和释放大部分时候不需要访问全局对象池）。
+内核把 Per-CPU 设计用于高频统计、本地缓存和调度数据等场景。它用汇总复杂度和额外内存换取本地快速路径，核心收益是避免共享写入，而不是让任意跨 CPU 操作自动安全。
 
-完成变量解决的是另一个问题：一个线程需要等待另一个线程完成某项工作后才能继续。这听起来像 mutex，但两者的语义不同。mutex 保护的是共享数据：同一时刻只有一个线程能访问被保护的数据。completion 传递的是事件通知：一个线程说"我做完了"，另一个线程才开始动。
+## 完成变量
+
+完成变量是内核中的事件同步对象，它让进程上下文等待某项活动到达已完成状态，并由执行该活动的上下文发出通知。
+
+mutex 表示“取得所有权后才能进入临界区”，completion 表示“某个里程碑尚未发生，发生后才继续”。例如驱动提交设备初始化后，调用任务可以等待初始化完成；中断处理或工作线程完成初始化时调用 `complete()`。等待者不需要占有完成者使用的数据，也不应反复检查状态并调用毫秒级睡眠函数 `msleep()` 猜测工作何时结束。
 
 ```c
-// include/linux/completion.h
-struct completion my_done;
-init_completion(&my_done);
+static DECLARE_COMPLETION(setup_done);
 
-// 线程 A：等待工作完成
-void thread_a(void) {
-    start_work();
-    wait_for_completion(&my_done);  // 阻塞，直到 complete() 被调用
-    use_result();
+void setup_worker(void)
+{
+    initialize_device();
+    complete(&setup_done);
 }
 
-// 线程 B：执行工作并通知完成
-void thread_b(void) {
-    do_work();
-    complete(&my_done);             // 唤醒等待者
+int start_device(void)
+{
+    queue_setup_work();
+    wait_for_completion(&setup_done);
+    return use_initialized_device();
 }
 ```
 
-`wait_for_completion()` 会让当前线程睡眠，直到另一个线程调用 `complete()` 唤醒它。内核中典型的使用场景是：模块初始化时启动一个内核线程，主线程调用 `wait_for_completion()` 等待内核线程初始化完毕后再继续；或者驱动程序提交一个 DMA 传输请求，然后用 `wait_for_completion()` 等待 DMA 完成中断的回调调用 `complete()`。
+completion 内部保存完成计数和等待队列。`complete()` 记录一次完成并唤醒一个等待者；如果通知先于 `wait_for_completion()` 发生，完成状态会被记住，后来的等待者可以直接继续，不会丢失唤醒。`complete_all()` 把对象标记为全部完成，使当前以及随后到达的等待者都能继续，直到调用方在确认并发使用已经结束后显式重新初始化；它的语义不同于连续调用一次 `complete()`。
 
-:::thinking 为什么内核不用 futex？
+等待接口可能睡眠，所以 `wait_for_completion()` 及其等待变体只能在允许睡眠、硬中断开启且抢占允许的进程上下文调用。发出通知的 `complete()` 不需要睡眠，可以由中断处理等上下文调用。带 timeout 或 interruptible 的等待接口会返回状态，调用者必须区分完成、超时和信号中断，不能把所有非正值合并为同一种结果。
 
-同步原语一课详细讲过 futex：它让用户态线程可以在一个用户态内存地址上原子地等待和唤醒。glibc 的 `pthread_mutex_lock()`、`pthread_cond_wait()` 等同步原语都建立在 futex 之上。那内核自己为什么不用 futex？
+完成对象的生命周期必须覆盖通知方与所有等待方。把 completion 放在栈上后进行超时等待尤其危险：函数超时返回并释放栈帧后，异步完成者若仍调用 `complete()`，就会写入失效内存。此时需要取消并等待异步活动结束，或把 completion 放进生命周期更长的对象。`reinit_completion()` 可以重置已协调好的对象，但不能在仍有并发等待或通知时用来强行开始下一轮。
 
-futex 解决的核心问题是跨越用户态-内核态边界的原子性：用户态做了 CAS（check），如果需要睡眠就通过系统调用进入内核（sleep），futex 保证这两步之间不会丢失唤醒。但内核代码本身已经运行在内核态了，不存在跨边界的问题。内核 mutex 直接用 spinlock 保护 check-and-sleep 的原子性（同步原语一课分析过这个机制），不需要 futex 作为中间层。
-
-futex 的另一个核心特性是"快速路径不进内核"。无竞争时一次 CAS 就完成加锁，不需要系统调用。但内核代码调用 `mutex_lock()` 时已经在内核态了，"进不进内核"这个区分没有意义。内核 mutex 的快速路径也是一次 CAS，和 futex 的快速路径在性能上没有差别。
-
-所以 futex 是专门为用户态设计的基础设施：解决用户态特有的跨边界原子性问题，并优化用户态特有的"避免系统调用"诉求。内核自己不需要这两样东西，直接用更简单的 spinlock + 等待队列组合就够了。
-:::
-
-:::expand SRCU(Sleepable RCU)
-
-RCU 的读侧临界区有一个硬性约束：不能睡眠。这是因为宽限期的检测依赖于 CPU 经过上下文切换来确认读侧临界区结束。如果读者在 `rcu_read_lock()` 和 `rcu_read_unlock()` 之间睡眠了，它的 CPU 会发生上下文切换（调度其他进程运行），RCU 子系统会误认为这个 CPU 已经经过了静止状态，从而过早结束宽限期。此时如果写者释放了旧数据，仍在睡眠的读者醒来后继续使用旧指针就会访问已释放的内存。
-
-但某些内核代码路径确实需要在 RCU 读侧临界区中执行可能睡眠的操作。SRCU(Sleepable RCU)就是为这种场景设计的。SRCU 使用 per-CPU 计数器来跟踪每个 CPU 上活跃的读者数量，而不是依赖上下文切换来推断读侧临界区的结束。`srcu_read_lock()` 增加当前 CPU 的读者计数，`srcu_read_unlock()` 减少计数。`synchronize_srcu()` 等待所有 CPU 的读者计数归零。这样即使读者睡眠了，只要它没有调用 `srcu_read_unlock()`，计数器就不为零，宽限期不会提前结束。
-
-代价是 SRCU 的读端不再是零开销：每次 `srcu_read_lock()` 和 `srcu_read_unlock()` 都需要修改 per-CPU 计数器（一次原子操作）。这比普通 RCU 的读端开销高，所以只在确实需要在读侧临界区中睡眠时才使用 SRCU。
-:::
+| 需求 | 合适原语 | 关键语义 |
+|------|----------|----------|
+| 保护共享不变量 | spinlock 或 mutex | 进入临界区前取得所有权 |
+| 读取一致值快照 | seqlock | 复制后验证版本，冲突时重试 |
+| 读取指针结构并延迟回收 | RCU | 移除后等待旧读者离开再释放 |
+| 高频本地更新 | Per-CPU 变量 | 分散写入，按需汇总 |
+| 等待一次工作到达里程碑 | completion | 完成状态可先于等待发生并被记住 |
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| 内核自旋锁 | 自旋 + 中断控制，四个变体对应不同的中断场景 |
-| 内核互斥量 | 睡眠锁，三条路径（CAS 快速 / optimistic spinning / 睡眠），仅限进程上下文 |
-| 顺序锁(seqlock) | 写者优先，读者通过序列计数器检测并重试，适合值类型的读多写少场景 |
-| RCU(Read-Copy-Update) | 读端零开销，写者复制更新并等待宽限期后回收旧数据 |
-| Per-CPU 变量 | 每 CPU 独立副本，消除共享和同步 |
-| 完成变量(completion) | 一次性事件通知，一个线程等待另一个线程完成工作 |
+| 执行上下文 | 决定代码能否睡眠、会被哪些入口打断以及可用的同步原语 |
+| 原子上下文 | 所有不能主动睡眠的中断、禁抢占、关中断或持自旋锁区间 |
+| 内核自旋锁 | 等待者不睡眠，并可配合 `_bh`、`_irq`、`_irqsave` 控制本地重入 |
+| lockdep | 记录锁类顺序和中断用法，验证已执行路径组成的潜在错误 |
+| 内核互斥量 | 允许竞争任务进入等待队列的进程上下文睡眠锁 |
+| 顺序锁 | 写者互斥，读者复制值后检查序列并在冲突时重试 |
+| RCU | 让旧读者继续访问有效对象，并把回收推迟到宽限期之后 |
+| 静止状态 | RCU 用来证明旧读侧临界区已经结束的可观察状态 |
+| Per-CPU 变量 | 按 CPU 拆分频繁写入，以额外内存和汇总代价减少共享竞争 |
+| 完成变量 | 记录工作完成事件并用等待队列唤醒进程上下文 |
 
-内核同步的设计哲学是让读的代价趋近于零：spinlock 让读写都付出自旋的代价，读写锁让读者之间不互斥，seqlock 让读者完全不阻塞写者，RCU 让读的开销降到一次禁用抢占，Per-CPU 变量连共享都消除了。从 spinlock 到 Per-CPU，每一步都在减少"读"这件事的代价。
+内核同步没有一条按性能从慢到快排列的原语清单，真正的选择顺序是先满足执行上下文，再确定要保护的是互斥、快照、对象生命周期、本地更新还是事件完成，最后才优化竞争成本。
 
 ---
 
-**Linux 源码入口**：
-- [`include/linux/spinlock.h`](https://elixir.bootlin.com/linux/latest/source/include/linux/spinlock.h) — spinlock API 与变体宏
-- [`kernel/locking/qspinlock.c`](https://elixir.bootlin.com/linux/latest/source/kernel/locking/qspinlock.c) — queued spinlock 实现
-- [`kernel/locking/mutex.c`](https://elixir.bootlin.com/linux/latest/source/kernel/locking/mutex.c) — mutex 实现与 optimistic spinning
-- [`include/linux/seqlock.h`](https://elixir.bootlin.com/linux/latest/source/include/linux/seqlock.h) — seqlock 定义与内联函数
-- [`kernel/rcu/tree.c`](https://elixir.bootlin.com/linux/latest/source/kernel/rcu/tree.c) — Tree RCU 核心实现
-- [`include/linux/percpu.h`](https://elixir.bootlin.com/linux/latest/source/include/linux/percpu.h) — Per-CPU 变量 API
-- [`include/linux/completion.h`](https://elixir.bootlin.com/linux/latest/source/include/linux/completion.h) — completion API
+**Linux 文档与源码入口**：
+- [Lock types and their rules](https://docs.kernel.org/locking/locktypes.html)：原子上下文、`spinlock_t` 与 PREEMPT_RT 语义
+- [Runtime locking correctness validator](https://docs.kernel.org/locking/lockdep-design.html)：锁类、依赖边与中断安全状态
+- [Generic Mutex Subsystem](https://docs.kernel.org/locking/mutex-design.html)：mutex 快速路径、乐观自旋与睡眠慢速路径
+- [Sequence counters and sequential locks](https://docs.kernel.org/locking/seqlock.html)：`seqcount_t`、`seqlock_t` 与读者重试规则
+- [RCU Concepts](https://docs.kernel.org/RCU/rcu.html)：移除、宽限期与延迟回收
+- [Using RCU to Protect Read-Mostly Linked Lists](https://docs.kernel.org/RCU/listRCU.html)：RCU 指针结构与对象生命周期实例
+- [this_cpu operations](https://docs.kernel.org/core-api/this_cpu_ops.html)：Per-CPU 地址、迁移约束与本地操作
+- [Completions](https://docs.kernel.org/scheduler/completion.html)：等待、通知、超时与对象生命周期
+- [`kernel/locking/`](https://github.com/torvalds/linux/tree/master/kernel/locking)：spinlock、mutex 与 lockdep 实现
+- [`kernel/rcu/`](https://github.com/torvalds/linux/tree/master/kernel/rcu)：Tree RCU、宽限期与回调实现
+- [`kernel/sched/completion.c`](https://github.com/torvalds/linux/blob/master/kernel/sched/completion.c)：completion 等待与唤醒实现

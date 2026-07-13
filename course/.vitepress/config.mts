@@ -154,7 +154,7 @@ export default withMermaid(
             { text: '文件与目录', link: '/filesystem/01-file-directory' },
             { text: 'VFS 与实现', link: '/filesystem/02-vfs' },
             { text: '日志与一致性', link: '/filesystem/03-journal-consistency' },
-            { text: '崩溃一致性实践', link: '/filesystem/04-crash-consistency' },
+            { text: '崩溃一致性', link: '/filesystem/04-crash-consistency' },
           ],
         },
         {

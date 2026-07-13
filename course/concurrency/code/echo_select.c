@@ -22,7 +22,7 @@ int main() {
     int max_fd = server_fd;
 
     while (1) {
-        read_fds = all_fds;   // select 会修改 fd_set，每次必须重新复制
+        read_fds = all_fds;   // select modifies fd_set, so copy it for every call.
         select(max_fd + 1, &read_fds, NULL, NULL, NULL);
 
         for (int fd = 0; fd <= max_fd; fd++) {

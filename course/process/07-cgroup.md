@@ -1,340 +1,247 @@
 # Cgroups
 
-- 写作时间：`2026-03-04 首次提交，2026-03-23 最近修改`
-- 当前字符：`12363`
+- 写作时间：`2026-03-04 首次提交，2026-07-13 最近修改`
+- 当前字符：`10372`
 
-上一课的 namespace 解决了隔离问题——让容器看不到宿主机的进程、文件系统和网络栈。但"看不到"不等于"用不了"。一个运行在独立 namespace 中的进程，仍然可以调用 `malloc` 吃掉宿主机所有内存，用一个死循环占满所有 CPU 核心，或者用 fork bomb 耗尽系统的 PID 资源。namespace 隔离了视图，没有限制用量。
+[命名空间](/process/06-namespace)让进程看到独立的 PID、挂载和网络视图，但“看不见宿主机资源”不代表“不能消耗宿主机资源”。隔离在新 PID namespace 中的程序仍可创建大量线程、持续占用 CPU、触碰大量内存页，或者不断向同一块磁盘提交 I/O。
 
-```bash
-# this process can consume all host memory, regardless of namespace
-stress --vm 1 --vm-bytes 8G
+来看一个具体场景。同一台机器运行两个服务：编译服务短时间内启动大量并行任务，数据库服务需要稳定的 CPU 和 I/O 延迟。如果只使用 namespace，内核知道它们看到的资源视图不同，却没有得到“编译服务最多使用多少资源”这一策略。资源仍由同一个调度器、内存管理器和块设备共同提供，一个服务的突发负载会影响另一个服务。
+
+cgroup 是 Linux 按层级组织任务，并让控制器对这些任务进行资源记账、分配和限制的机制。本课先通过 **cgroup v2** 建立统一层级、文件接口和控制器启用规则；随后，**CPU 控制器**处理份额与带宽，**内存控制器**处理回收阈值与硬上限，**I/O 控制器**限制块设备吞吐和操作次数，**PID 控制器**限制可创建的任务数量。最后用 **内核表示** 解释目录、控制器状态与进程归属如何连接起来。
+
+## cgroup v2
+
+cgroup v2 是把所有控制器组织在同一棵层级树中的 Linux 资源控制接口。
+
+系统通常把 `cgroup2` 伪文件系统挂载在 `/sys/fs/cgroup`。伪文件系统不在磁盘上保存普通文件内容：目录对应内核中的 cgroup 节点，控制文件由内核动态生成；用户空间对这些文件执行 `read()` 或 `write()`，内核便读取状态或修改策略。
+
+层级结构表达管理边界。父 cgroup 把自己获得的资源继续分给子 cgroup，子节点只能进一步收紧约束，不能绕过祖先限制：
+
+```text
+/sys/fs/cgroup
+└── course
+    ├── compiler
+    └── database
 ```
 
-不管这个 `stress` 在哪个 PID namespace、哪个 Mount namespace 里，它一样消耗 8 GB 物理内存。宿主机上的其他进程（包括其他容器）会因为内存不足被 OOM killer 杀掉。一个容器的失控导致所有容器受害。
+`compiler` 和 `database` 是兄弟节点，可以在共同父节点 `course` 分得的范围内设置不同策略。新进程默认继承父进程当时的 cgroup 归属；把一个现有进程迁移到其他 cgroup，不会连带迁移它已经存在的子进程。
 
-解决这个问题需要 **cgroup**（control group）——内核提供的资源限制机制，通过虚拟文件系统对一组进程施加配额。cgroup 本身只是一个分组框架，真正的限制由挂载在上面的控制器完成。**CPU 控制器**限制进程组的 CPU 时间，**内存控制器**限制内存使用量并在超限时触发回收或杀死进程，**I/O 控制器**限制对块设备的读写带宽，**PID 控制器**限制能创建的进程总数。最后看**内核实现**如何把进程和 cgroup 关联起来。
+三个文件构成最基本的控制流程：
 
-## cgroup
+| 文件 | 语义 |
+|------|------|
+| `cgroup.controllers` | 当前节点可以为子层启用的控制器 |
+| `cgroup.subtree_control` | 当前节点已经启用、用于管理直接子节点的控制器 |
+| `cgroup.procs` | 直接归属于当前节点的进程 PID；写入 PID 会迁移整个线程组 |
 
-cgroup（control group，控制组）是内核提供的资源限制机制，通过虚拟文件系统（`/sys/fs/cgroup/`）对一组进程的 CPU、内存、I/O、PID 等资源施加配额。
+“可用”和“已启用”是两个不同状态。某个控制器只有先出现在父节点的 `cgroup.controllers` 中，才能用 `+controller` 写入父节点的 `cgroup.subtree_control`；启用后，直接子节点才获得该控制器的接口文件。委派(delegation)是把一棵 cgroup 子树的组织权限交给权限较低的管理者。下面的命令假设 `/sys/fs/cgroup/course` 已完成委派，而且 `cpu`、`memory`、`io`、`pids` 均可用：
 
-:::expand 虚拟文件系统
-
-这里的"文件系统"不是指磁盘上存文件的 ext4 或 XFS，而是内核伪造的一组文件和目录。这些文件背后没有磁盘数据，内核在你 `read` 时动态生成内容，在你 `write` 时解析内容并执行操作。上一篇提到的 `/proc` 就是同一类东西：`cat /proc/1234/status` 不是从磁盘读文件，而是内核临时拼出该进程的状态信息返回给你。
-
-这正是 Linux "一切皆文件"设计原则的体现。进程信息、设备、内核参数、cgroup 配额，这些东西本质上都不是文件，但内核把它们统一暴露为文件和目录。结果是：用户态不需要为每种内核资源学一套专门的 API，用同一组文件操作（`open`、`read`、`write`、`mkdir`）就能和所有这些资源交互。
-
-| 挂载点 | 文件系统类型 | 暴露的内容 |
-|--------|------------|-----------|
-| `/proc` | procfs | 进程状态、内核参数 |
-| `/sys` | sysfs | 设备、驱动、内核子系统 |
-| `/sys/fs/cgroup` | cgroup2 | cgroup 层级和资源配额 |
-| `/dev` | devtmpfs | 硬件设备（磁盘、终端、随机数生成器） |
-
-所以下文所有对 `/sys/fs/cgroup/` 下文件的 `echo` 和 `cat`，实质上是在向内核发命令和读状态，不是在操作磁盘文件。
-
-这个设计还带来了两个额外好处。**可扩展性**：新增控制器或参数只需要让内核在目录下多创建几个文件，不需要新增系统调用号、不需要用户态工具同步更新。**权限控制**：`chown` 一个 cgroup 目录给普通用户，该用户就能管理这个 cgroup 下的资源，粒度到目录和文件级别。
-
-:::
-
-cgroup 的操作全部通过这个虚拟文件系统完成。目录结构对应 cgroup 的层级结构。创建子 cgroup 就是创建子目录，把进程移入 cgroup 就是往文件里写 PID，读取资源用量就是读文件。标准的 `mkdir`、`echo`、`cat` 就够了。
-
-```bash
-# view the root cgroup
-ls /sys/fs/cgroup/
-cgroup.controllers  cgroup.procs  cgroup.subtree_control  cpu.stat  memory.current ...
-
-# create a child cgroup = just mkdir
-mkdir /sys/fs/cgroup/my-group
+```sh
+cd /sys/fs/cgroup/course
+echo "+cpu +memory +io +pids" > cgroup.subtree_control
+mkdir compiler database
+echo "$COMPILER_PID" > compiler/cgroup.procs
+echo "$DATABASE_PID" > database/cgroup.procs
 ```
 
-这里有三个关键文件需要了解：
+控制器按自顶向下(top-down)规则启用：非根节点只能启用父节点已经交给它的控制器；只要某个子节点仍启用了控制器，父节点就不能先关闭它。资源限制也沿层级累计生效，例如 `course` 的内存上限是 2 GiB 时，两个子节点合计不能越过这个祖先上限，即使各自写入了更大的值。
 
-**`cgroup.controllers`** 列出了当前 cgroup 可用的控制器。根 cgroup 的 `cgroup.controllers` 显示了内核编译时启用的所有控制器：
+cgroup v2 把按完整进程承载资源消耗的普通节点称为 domain cgroup。它还受到“无内部进程”(no internal process)约束：除根节点外，domain cgroup 若要在 `cgroup.subtree_control` 中启用 domain 控制器，自身不能直接容纳进程；进程应迁入它的子节点。这样，父节点负责向子节点分配资源，实际工作负载位于叶子，控制器不必同时比较父节点自己的进程与其子节点。若违反这项约束，启用操作会失败。
 
-```bash
-cat /sys/fs/cgroup/cgroup.controllers
-cpu io memory pids
-```
+本课以普通 domain 模式和进程粒度为主。v2 还提供 threaded subtree，让同一进程的线程在受限制的子树内分别归组；此时使用 `cgroup.threads`，而 `cpu`、`pids` 等支持 threaded 模式的控制器需要处理线程级归属。
 
-**`cgroup.subtree_control`** 决定了哪些控制器对子 cgroup 生效。可用不等于启用，控制器必须被显式写入 `cgroup.subtree_control` 后，子 cgroup 中才会出现对应的控制文件：
+:::expand cgroup v1
 
-```bash
-# enable cpu and memory controllers for children
-echo "+cpu +memory" > /sys/fs/cgroup/cgroup.subtree_control
+cgroup v1 允许不同控制器挂载在不同层级中，同一进程可以在 CPU、内存和 I/O 层级处于不同位置。灵活性带来了组合复杂度：管理器需要同时维护多棵树，控制器之间也难以形成一致的进程归属。
 
-# now child cgroups will have cpu.max, memory.max, etc.
-```
-
-**`cgroup.procs`** 列出了当前 cgroup 中的所有进程 PID。向这个文件写入一个 PID，就能把该进程移入这个 cgroup。一个进程在同一时刻只属于一个 cgroup。
-
-```bash
-# move current shell into my-group
-echo $$ > /sys/fs/cgroup/my-group/cgroup.procs
-
-# check which processes are in this cgroup
-cat /sys/fs/cgroup/my-group/cgroup.procs
-```
-
-cgroup 是层级结构。子 cgroup 受父 cgroup 的限制：如果父 cgroup 的内存上限是 1 GB，子 cgroup 即使设置 2 GB，实际可用也只有 1 GB。资源限制向下继承，子节点不能超过父节点的配额。
-
-:::expand cgroup v1 与 v2
-
-Linux 存在两个版本的 cgroup 接口。cgroup v1（2007 年，Linux 2.6.24）为每种控制器维护独立的层级结构，每种控制器挂载为独立的文件系统（如 `/sys/fs/cgroup/cpu/`、`/sys/fs/cgroup/memory/`）。这导致一个问题：同一个进程在 CPU 层级的位置和在内存层级的位置可以不同，管理工具需要分别操作多棵树，配置容易不一致。
-
-cgroup v2（2016 年，Linux 4.5）把所有控制器统一到一棵层级树上，挂载点只有一个 `/sys/fs/cgroup/`。一个进程在树中有唯一的位置，所有控制器的配置都在同一个目录下。本篇只讨论 v2。现代发行版（Ubuntu 21.10+、Fedora 31+、Debian 11+）默认使用 v2。
+cgroup v2 用统一层级约束进程归属，并统一了控制文件命名和委派模型。系统仍可能采用 v1、v2 或混合挂载，因此判断接口版本应查看实际挂载类型，而不能只根据发行版名称推断。本课后续内容只讨论 v2。
 
 :::
 
 ## CPU 控制器
 
-CPU 控制器通过 `cpu.max` 和 `cpu.weight` 控制进程组的 CPU 使用。
+CPU 控制器是为 cgroup 中的普通公平调度任务分配相对 CPU 份额并限制最大 CPU 带宽的控制器。
 
-没有 CPU 控制器时，一个进程可以执行死循环占满整个 CPU 核心。如果它创建多个线程，可以占满所有核心。同一台机器上的其他容器被饿死，完全分不到 CPU 时间。
+它直接连接 [Linux 调度器](/process/05-linux-scheduler)中的组调度。`cpu.weight` 表达活跃兄弟 cgroup 之间的相对权重，范围为 1 到 10000，默认值为 100。假设两个兄弟 cgroup 的权重分别是 100 和 300，并且它们的公平调度任务持续竞争同一组可用 CPU，在没有其他约束时，目标份额约为 1:3。这个比例只在竞争时有意义；一侧没有可运行任务时，另一侧可以使用空闲处理器时间。
 
-CPU 控制器提供了两种限制方式，分别解决两个不同的问题。
+权重不是整个系统上的固定百分比。实际结果还受到祖先权重、其他兄弟节点、任务 nice 值、CPU 亲和性、处理器容量以及 `cpu.max` 的共同影响：
 
-**`cpu.max`：绝对上限。** 格式是 `$QUOTA $PERIOD`，单位微秒。含义是：在每个 `$PERIOD` 微秒的时间窗口内，这个 cgroup 中的所有进程加起来最多使用 `$QUOTA` 微秒的 CPU 时间。
-
-```bash
-# allow max 50% of one CPU core
-# 50000 us quota per 100000 us period = 50%
-echo "50000 100000" > /sys/fs/cgroup/my-group/cpu.max
-
-# allow max 2 full CPU cores
-echo "200000 100000" > /sys/fs/cgroup/my-group/cpu.max
-
-# remove limit
-echo "max 100000" > /sys/fs/cgroup/my-group/cpu.max
+```sh
+echo 100 > compiler/cpu.weight
+echo 300 > database/cpu.weight
 ```
 
-`$QUOTA` 写 `max` 表示不限制。`cpu.max` 的默认值就是 `max 100000`（不限制，周期 100ms）。
+`cpu.max` 设置公平调度任务的带宽上限，格式为 `$MAX $PERIOD`，两个值都以微秒计。默认值 `max 100000` 表示每 100000 微秒重新开始一个周期，但不限制可消耗的 CPU 时间：
 
-**`cpu.weight`：比例分配。** 取值范围是 1-10000，默认值是 100。当多个 cgroup 竞争同一个 CPU 时，内核按 weight 的比例分配时间。
+```sh
+# 每 100 ms 最多消耗 50 ms CPU 时间，相当于平均 0.5 个 CPU
+echo "50000 100000" > compiler/cpu.max
 
-```bash
-# cgroup A: weight 100 (default)
-echo 100 > /sys/fs/cgroup/group-a/cpu.weight
-
-# cgroup B: weight 300
-echo 300 > /sys/fs/cgroup/group-b/cpu.weight
-
-# when both competing: A gets 25%, B gets 75%
-# when only A is running: A gets 100% (weight only matters under contention)
+# 每 100 ms 最多消耗 200 ms CPU 时间，相当于平均 2 个 CPU
+echo "200000 100000" > database/cpu.max
 ```
 
-:::thinking 有了 cpu.max 为什么还需要 cpu.weight？
-`cpu.max` 设的是硬上限。假设一台 4 核机器上有两个容器 A 和 B，都设了 `cpu.max = 200000 100000`（最多 2 核）。当 A 空闲时，B 也只能用 2 核，剩下 2 核的计算能力白白浪费。`cpu.max` 防止单个容器吃光所有 CPU，但它会导致资源浪费。
+配额统计的是 cgroup 在所有允许 CPU 上累计执行的时间，不是把任务固定到某几个核心。多线程可以在多个 CPU 上快速消耗配额；配额耗尽后，组内公平调度任务会被节流，直到下一个周期补充带宽。若要限制任务可运行在哪些 CPU 上，需要 CPU 亲和性或 cpuset 控制器，而不是 `cpu.max`；cpuset 控制器负责限定任务可使用的 CPU 和 NUMA 内存节点集合。
 
-`cpu.weight` 设的是比例。没有硬上限，只在竞争时按比例分。A 空闲时，B 可以用满 4 核；A 和 B 同时忙时，按 weight 比例分配。不浪费资源，但也挡不住单个容器在无竞争时独占所有 CPU。
+`cpu.stat` 提供观测证据。`usage_usec`、`user_usec`、`system_usec` 统计累计 CPU 时间；控制器启用后，`nr_periods`、`nr_throttled` 和 `throttled_usec` 分别反映经历的配额周期、发生节流的周期数和累计节流时间。只写限制而不观察这些计数，无法判断负载究竟受到竞争还是配额影响。
 
-两种机制正交。实际使用中通常同时设置：`cpu.max` 设一个硬上限防止极端情况，`cpu.weight` 在上限之下按比例公平分配。
+:::thinking 为什么同时需要 cpu.weight 和 cpu.max？
+
+若只设置 `cpu.weight`，系统在竞争时可以按策略分配份额，并在其他组空闲时充分利用 CPU；但单个组在无竞争时没有硬上限。若只设置 `cpu.max`，可以阻止某组越过带宽配额，却不能表达多个未触顶组之间谁更重要。
+
+两者控制不同问题：weight 决定竞争时的相对分配，max 决定无论竞争与否都不能长期越过的带宽。实际策略可以只使用其中一种，也可以先用祖先和兄弟权重分配份额，再用 max 设置故障边界。
 
 :::
+
+这里的两个接口只作用于 fair-class 调度任务；实时调度任务不遵循同一组 weight 和 bandwidth 语义，不能把 `cpu.max` 当成对所有调度类的统一 CPU 上限。
 
 ## 内存控制器
 
-内存控制器通过 `memory.max` 和 `memory.high` 限制进程组的内存使用量，超限触发 OOM killer 或回收压力。
+内存控制器是对 cgroup 及其后代的受控内存进行记账、回收、节流和内存耗尽(Out of Memory, OOM)处理的控制器。
 
-没有内存控制器时，一个进程调用 `malloc` 分配内存，只要物理内存还有余量，内核就会满足。一个失控的容器可以把物理内存吃光，内核的 OOM killer 开始在整个系统范围内挑选进程杀掉。哪个进程被杀完全取决于 OOM 评分算法，可能是别的容器里正在提供服务的进程。
+内存记账不等于 `malloc()` 参数的简单相加。`malloc()` 主要建立用户空间分配关系，匿名页通常在进程真正访问时才由缺页路径分配并计入 cgroup；匿名页是不以普通文件为持久后备的堆、栈等内存页。控制器还会统计文件页缓存、部分内核内存和套接字缓冲区等资源。文件页缓存是 RAM 中保存的文件数据副本，读取命中时可以避免再次访问存储设备。
 
-**`memory.max`：硬上限。** 当 cgroup 的内存使用量达到 `memory.max` 时，内核先尝试回收该 cgroup 内的可回收内存（页面缓存等）。如果回收后仍然不够，内核触发 OOM killer，但只在这个 cgroup 内部选择进程杀掉，不影响其他 cgroup。
+`memory.current` 显示当前 cgroup 及其后代已计入的内存总量。限制策略中的两个核心边界是：
 
-```bash
-# limit to 256 MB
-echo 268435456 > /sys/fs/cgroup/my-group/memory.max
+| 文件 | 语义 |
+|------|------|
+| `memory.high` | 节流边界；超过后让相关进程承受强回收压力，但不触发 OOM killer |
+| `memory.max` | 硬边界；到达后若回收仍不能降低用量，在该 cgroup OOM 域中启动 OOM 处理 |
 
-# or use shorthand (kernel 4.5+)
-echo 256M > /sys/fs/cgroup/my-group/memory.max
+回收(reclaim)是内核释放可回收内存的过程，例如丢弃之后可从文件重新读取的干净页缓存，或者在允许时把匿名页换出到 swap。超过 `memory.high` 的进程会被节流并参与直接回收，因此延迟上升；极端并发条件下，用量仍可能暂时越过 high。这个边界适合由管理程序持续观察并调整，而不是作为绝对封顶值。
+
+`memory.max` 用于最终约束。若 cgroup 到达 max 且回收没有取得足够进展，内核进入 cgroup OOM 状态。这里的 OOM 表示当前内存分配域无法满足分配；OOM killer 是内核为恢复进展而选择并终止任务的机制。由某个 cgroup 的 max 触发时，候选任务限制在该 cgroup 的层级中；若触发的是更高祖先的限制，候选范围也相应扩大到那个祖先的后代，不能笼统地理解成“永远只影响最内层目录”。
+
+下面为数据库设置 384 MiB 的节流边界和 512 MiB 的硬边界：
+
+```sh
+echo 402653184 > database/memory.high
+echo 536870912 > database/memory.max
 ```
 
-**`memory.high`：软上限。** 不会触发 OOM kill，但当用量超过 `memory.high` 时，内核大幅增加该 cgroup 的内存回收压力。回收意味着把页面换出到 swap 或丢弃页面缓存，进程的内存访问变慢（需要重新从磁盘读取），但进程不会被杀。
+`memory.events` 中的 `high`、`max`、`oom` 和 `oom_kill` 计数分别记录触发节流、触碰硬边界、进入 OOM 状态和实际杀死任务的次数。`memory.events` 会汇总后代事件；只观察当前节点自身时使用 `memory.events.local`。如果一个工作负载中的多个进程必须作为整体存活或退出，可以设置 `memory.oom.group=1`，让该 cgroup 在 OOM 选择中按组处理。
 
-```bash
-echo 128M > /sys/fs/cgroup/my-group/memory.high
-```
-
-`memory.high` 和 `memory.max` 配合使用：`memory.high` 设为期望的正常用量（超过就减速），`memory.max` 设为绝对上限（超过就杀）。进程在两者之间运行时会受到回收压力变慢，但还能活着。这比一超限就杀进程更友好。
-
-**`memory.current`** 显示了当前 cgroup 的实际内存使用量（单位是字节）：
-
-```bash
-cat /sys/fs/cgroup/my-group/memory.current
-134217728
-```
-
-OOM killer 在选择杀哪个进程时，依据的是 `oom_score`。每个进程在 `/proc/[pid]/oom_score` 有一个分数，分数越高越容易被杀。内核根据进程的内存占用量计算基础分，占用越多分越高。管理员可以通过 `/proc/[pid]/oom_score_adj`（取值 -1000 到 1000）调整：写入负数降低被杀概率（保护关键服务），写入 1000 表示优先杀掉。在 cgroup 内部触发 OOM 时，内核只在该 cgroup 的进程中比较 `oom_score`，选分数最高的杀掉。
+交换空间是磁盘或其他存储上用于暂存匿名内存页的区域，由 `memory.swap.max` 单独限制。`memory.max` 约束受控内存用量并不等价于同时设置 swap 上限；希望控制匿名内存换出规模时，需要把两者作为不同资源配置。
 
 ## I/O 控制器
 
-I/O 控制器通过 `io.max` 限制进程组对块设备的读写带宽和 IOPS（每秒 I/O 操作数）。
+I/O 控制器是按块设备对 cgroup 的读写带宽和每秒 I/O 操作数进行记账与限制的控制器。
 
-没有 I/O 控制器时，一个容器执行大量磁盘写入（比如数据库批量导入），可以占满磁盘 I/O 带宽。同一块磁盘上的其他容器的读写请求被排在后面，延迟急剧上升。
+块设备是按固定大小数据块提供随机访问的存储设备，例如磁盘、SSD 或逻辑卷。内核用主设备号和次设备号 `MAJ:MIN` 标识一个块设备；`io.max` 的每一行先指定目标设备，再配置一个或多个限制：
 
-**`io.max`** 对指定块设备设置了带宽和 IOPS 上限，格式如下：
+| 键 | 含义 |
+|----|------|
+| `rbps` | 每秒最多读取的字节数 |
+| `wbps` | 每秒最多写入的字节数 |
+| `riops` | 每秒最多提交的读 I/O 次数 |
+| `wiops` | 每秒最多提交的写 I/O 次数 |
 
-```
-MAJ:MIN rbps=BYTES wbps=BYTES riops=COUNT wiops=COUNT
-```
+每秒字节数(Bytes Per Second, BPS)表示单位时间允许传输的字节量，每秒 I/O 操作数(Input/Output Operations Per Second, IOPS)表示单位时间允许通过控制点的 I/O 请求数量。下面的示例把设备 `8:0` 的读带宽限制为 50 MiB/s、写带宽限制为 10 MiB/s，并同时限制操作次数：
 
-`MAJ:MIN` 是块设备的主次设备号（可以通过 `lsblk` 或 `ls -l /dev/sda` 查看）。四个参数分别限制了读带宽（bytes/s）、写带宽（bytes/s）、读 IOPS 和写 IOPS。
-
-```bash
-# find device number
-ls -l /dev/sda
-# brw-rw---- 1 root disk 8, 0 ...  (major=8, minor=0)
-
-# limit write bandwidth to 10 MB/s on device 8:0
-echo "8:0 wbps=10485760" > /sys/fs/cgroup/my-group/io.max
-
-# limit both read and write
-echo "8:0 rbps=52428800 wbps=10485760 riops=1000 wiops=500" > /sys/fs/cgroup/my-group/io.max
+```sh
+echo "8:0 rbps=52428800 wbps=10485760 riops=1000 wiops=500" \
+  > database/io.max
 ```
 
-**`io.stat`** 显示了各块设备的实际 I/O 统计：
+`8:0` 只是格式示例，实际配置必须使用承载工作负载的块设备编号。达到限制后，控制器延迟后续 I/O；接口允许短暂突发，因此瞬时速率不一定严格贴着配置值。把某个键写成 `max` 可以移除该方向的限制。
 
-```bash
-cat /sys/fs/cgroup/my-group/io.stat
-8:0 rbytes=1048576 wbytes=524288 rios=256 wios=128 ...
-```
+`io.stat` 按设备记录 `rbytes`、`wbytes`、`rios`、`wios` 等累计值，分别对应读写字节数和读写操作数。限制应配置在真正接收 I/O 的设备层；如果文件系统位于设备映射器、磁盘阵列或其他分层块设备之上，逻辑设备与物理设备看到的请求可能不同。
+
+缓冲写入还跨越内存与 I/O 两个控制域。进程先把数据写入页缓存并把页面标记为脏页，内核随后通过回写(writeback)异步提交块 I/O。cgroup writeback 会结合内存页和表示文件的内核对象归属，把回写请求记到相应 I/O cgroup；但这需要文件系统支持，不支持的文件系统可能把回写归到根 cgroup。因此，`write()` 返回时的应用吞吐、`io.stat` 中的设备流量和存储设备实际负载不一定在同一时刻变化。
 
 ## PID 控制器
 
-PID 控制器通过 `pids.max` 限制进程组能创建的进程总数，防止 fork bomb 耗尽系统 PID。
+PID 控制器是限制 cgroup 及其后代可同时拥有多少个内核任务的控制器。
 
-:::thinking fork bomb :(){ :|:& };: 为什么危险？
+这里的“PID”按内核任务 ID，也就是线程 ID(Thread ID, TID)计数。TID 标识一个可调度线程：单线程进程占用一个计数，含 20 个线程的进程通常占用 20 个计数。PID namespace 改变编号和可见性，PID 控制器限制数量，两者解决的是不同问题。
 
-把这段 bash 展开：它定义了一个函数 `:`，函数体是 `: | : &`，然后调用 `:`。每次调用会产生两个新的 `:` 进程（一个管道的两端），每个新进程又各自产生两个。进程数量以 2^n 指数增长。几秒内就能创建几万个进程，耗尽系统的 PID 空间（默认上限 `/proc/sys/kernel/pid_max`，通常 32768 或 4194304）。PID 耗尽后，系统上任何程序都无法 `fork()`，包括 SSH 登录、cron 任务、系统服务。机器还在运行，但什么新进程都起不来，实际上已经不可用了。
+`pids.max` 设置层级硬上限，默认值 `max` 表示当前节点不增加额外限制。`pids.current` 统计当前 cgroup 及其后代的任务数量，`pids.peak` 记录历史峰值：
 
-没有 PID 控制器时，一个容器里的 fork bomb 会耗尽整台宿主机的 PID 资源，所有容器和宿主机服务全部受影响。
-
-:::
-
-**`pids.max`** 设置了 cgroup 内允许的最大进程数（包括子 cgroup 中的进程）：
-
-```bash
-# limit to 100 processes
-echo 100 > /sys/fs/cgroup/my-group/pids.max
+```sh
+echo 100 > compiler/pids.max
 ```
 
-达到上限后，cgroup 内的 `fork()` 和 `clone()` 会返回 `EAGAIN` 错误，不会创建新进程。已有的进程不受影响，只是不能再创建新的。
+创建进程和创建线程最终都会进入 `fork()` 或 `clone()` 的任务创建路径。若新增任务会使当前 cgroup 或任一祖先越过 `pids.max`，创建操作返回 `EAGAIN`。因此，限制既能阻止进程快速递归创建后代，也会影响使用大量线程的程序；[线程](/concurrency/01-thread)会说明用户态线程库怎样使用 `clone()` 建立内核线程。
 
-**`pids.current`** 显示了当前 cgroup 中的进程数：
+cgroup 的组织操作不受这项策略阻止。管理员可以把 `pids.max` 调低到 `pids.current` 以下，也可以迁入足够多的现有任务，使 current 暂时大于 max；已有任务不会因此被自动终止，但后续创建会继续失败，直到计数回到限制以内。`pids.events` 的 `max` 计数可用于观察层级中发生了多少次上限命中。
 
-```bash
-cat /sys/fs/cgroup/my-group/pids.current
-3
-```
+限制任务数量不能替代内存限制。一个任务可以消耗大量内存，而大量轻量任务也可能在耗尽内存前先耗尽 PID 和调度结构；两类资源需要分别控制。
 
-Docker 默认不设置 `pids.max`（无限制）。可以通过 `--pids-limit` 参数启用：`docker run --pids-limit 100 ...`。Kubernetes 从 1.14 开始支持通过 kubelet 的 `--pod-max-pids` 参数设置每个 Pod 的 PID 上限。
+## 内核表示
 
-## 内核实现
+cgroup 的内核表示是 `task_struct` 通过 `css_set` 关联统一层级中的 cgroup 节点及各控制器状态的引用关系。
 
-进程和 cgroup 的内核关联通过 `task_struct` → `css_set` → `cgroup_subsys_state` 链路实现。
-
-上一篇讲 namespace 时，进程和 namespace 的关联是 `task_struct` → `nsproxy` → 各种 namespace 结构体。cgroup 的关联方式类似但更复杂，因为一个进程需要同时属于多个控制器的 cgroup，而且多个进程可能共享同一组 cgroup 归属。
-
-每个进程的 `task_struct` 有一个 `cgroups` 指针，指向 `css_set`：
+每个任务的 `task_struct->cgroups` 指向 `struct css_set`。`css_set` 表示该任务完整的 cgroup 归属组合；归属相同的多个任务可以共享同一个实例，从而在 `fork()` 和 `exit()` 热路径上只维护一组引用：
 
 ```c
-// include/linux/sched.h (simplified)
-struct task_struct {
-    struct css_set __rcu  *cgroups;   // which cgroups this task belongs to
-    // ...
-};
-```
-
-`css_set`（control group subsystem state set）聚合了一个进程在每个控制器中的 cgroup 归属。它是一个中间层：多个进程如果属于完全相同的一组 cgroup（同一个 CPU cgroup、同一个内存 cgroup、同一个 I/O cgroup……），就共享同一个 `css_set`，通过引用计数管理。
-
-```c
-// include/linux/cgroup-defs.h (simplified)
+/* include/linux/cgroup-defs.h, trimmed */
 struct css_set {
-    refcount_t              refcount;
     struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
-    // subsys[cpu]    → this task's CPU cgroup state
-    // subsys[memory] → this task's memory cgroup state
-    // subsys[io]     → this task's I/O cgroup state
-    // subsys[pids]   → this task's PID cgroup state
+    refcount_t refcount;
+    struct css_set *dom_cset;
+    struct cgroup *dfl_cgrp;
+    /* task lists and migration fields omitted */
 };
 ```
 
-`subsys[]` 数组的每个元素是一个 `cgroup_subsys_state`（简称 css），代表一个进程在某个控制器中所属的 cgroup 节点。每个 cgroup 目录（如 `/sys/fs/cgroup/my-group/`）在内核中对应一个 `struct cgroup`，每个控制器在该 cgroup 上有一个 `cgroup_subsys_state`：
+`dfl_cgrp` 指向任务在 cgroup v2 默认层级中的节点。`subsys[]` 为每个已注册控制器提供 `cgroup_subsys_state`（简称 css）指针；如果某个控制器没有在当前节点启用，对应指针可能指向最近的已启用祖先状态，这正是控制器自顶向下生效的内核表示。
+
+每个 cgroup 目录对应 `struct cgroup`。每个控制器在一个节点上的具体状态都包含 `struct cgroup_subsys_state` 成员，它记录所属 cgroup、控制器类型和父子关系；控制器再在外层结构中保存自己的计数器与策略字段。PID 控制器就是一个直接例子：
 
 ```c
-// include/linux/cgroup-defs.h (simplified)
-struct cgroup_subsys_state {
-    struct cgroup          *cgroup;     // which cgroup node
-    struct cgroup_subsys   *ss;         // which controller (cpu, memory, ...)
-    refcount_t              refcnt;
-    // ...
+/* kernel/cgroup/pids.c, trimmed */
+struct pids_cgroup {
+    struct cgroup_subsys_state css;
+    atomic64_t counter;
+    atomic64_t limit;
+    int64_t watermark;
+    /* event counters omitted */
 };
 ```
 
-每种控制器用 `cgroup_subsys` 描述自己，并注册了回调函数供内核在特定事件时调用：
+`struct cgroup_subsys` 描述控制器本身，并提供创建状态、迁移任务、创建任务和退出任务等回调。PID 控制器把 `pids_can_fork()` 注册为 `can_fork` 回调；任务创建前，它沿当前 cgroup 到祖先逐层尝试增加计数，只要一层越过限制就撤销计数并返回 `EAGAIN`。
 
-```c
-// include/linux/cgroup-defs.h (simplified)
-struct cgroup_subsys {
-    int (*css_online)(struct cgroup_subsys_state *css);     // cgroup activated
-    void (*css_offline)(struct cgroup_subsys_state *css);   // cgroup deactivated
-    void (*attach)(struct cgroup_taskset *tset);            // process moved into cgroup
-    void (*fork)(struct task_struct *task);                  // new process created
-    void (*exit)(struct task_struct *task);                  // process exiting
-    const char *name;                                        // "cpu", "memory", "io", "pids"
-    // ...
-};
-```
+把 PID 写入 `cgroup.procs` 时，cgroup 核心为目标归属查找或创建合适的 `css_set`，再把任务从旧集合迁移到新集合。创建子任务时，子任务默认继承父任务的集合；控制器回调可以在提交创建前检查策略，在退出时撤销记账。
 
-当执行 `echo $PID > /sys/fs/cgroup/my-group/cgroup.procs` 把进程移入新 cgroup 时，内核为该进程查找或创建一个新的 `css_set`（对应新的 cgroup 组合），更新 `task_struct->cgroups` 指针，然后调用相关控制器的 `attach` 回调。`fork()` 时，子进程默认继承父进程的 `css_set`（引用计数 +1），控制器的 `fork` 回调被调用（比如 PID 控制器在这里检查是否超过 `pids.max`）。
-
-完整的引用关系如下：
-
-```
+```text
 task_struct
-├── *cgroups ──→ struct css_set
-│                ├── refcount
-│                ├── subsys[cpu]    ──→ struct cgroup_subsys_state ──→ struct cgroup (my-group)
-│                ├── subsys[memory] ──→ struct cgroup_subsys_state ──→ struct cgroup (my-group)
-│                ├── subsys[io]     ──→ struct cgroup_subsys_state ──→ struct cgroup (my-group)
-│                └── subsys[pids]   ──→ struct cgroup_subsys_state ──→ struct cgroup (my-group)
-│
-├── *nsproxy ──→ struct nsproxy     (namespace, from previous chapter)
-│
-└── *cred ──→ struct cred
-              └── *user_ns          (user namespace, from previous chapter)
+└── cgroups ── struct css_set
+               ├── dfl_cgrp ── struct cgroup
+               └── subsys[] ── cgroup_subsys_state
+                                ├── CPU controller state
+                                ├── memory controller state
+                                ├── I/O controller state
+                                └── pids_cgroup
 ```
 
-和 namespace 的 `nsproxy` 对比：`nsproxy` 聚合的是进程的各 namespace 归属（PID namespace、Mount namespace……），`css_set` 聚合的是进程的各 cgroup 归属（CPU cgroup、内存 cgroup……）。两者都是 `task_struct` 上的一个指针，都可以被多个进程共享，都用引用计数管理生命周期。
+[命名空间](/process/06-namespace)中的 Cgroup namespace 只改变进程看到的 cgroup 根和路径；`task_struct->cgroups` 才决定任务实际接受哪些资源策略。容器运行时通常同时设置 namespace 与 cgroup：前者限制资源视图，后者进行资源记账、分配和限制。
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| cgroup（控制组） | 内核的资源限制机制，通过虚拟文件系统（`/sys/fs/cgroup/`）操作 |
-| `cgroup.controllers` | 列出可用的控制器 |
-| `cgroup.subtree_control` | 启用子 cgroup 的控制器 |
-| `cgroup.procs` | 列出或移动进程 |
-| CPU 控制器 | `cpu.max`（绝对上限）和 `cpu.weight`（比例分配） |
-| 内存控制器 | `memory.max`（硬上限，OOM kill）和 `memory.high`（软上限，回收压力） |
-| I/O 控制器 | `io.max` 限制块设备的带宽和 IOPS |
-| PID 控制器 | `pids.max` 限制进程总数，防止 fork bomb |
-| `css_set` | 聚合进程在每个控制器中的 cgroup 归属 |
-| `cgroup_subsys_state` | 进程在某个控制器中所属的 cgroup 节点 |
-| `cgroup_subsys` | 描述控制器本身，注册 attach/fork/exit 回调 |
+| cgroup v2 | 在统一层级中组织任务，并通过伪文件系统配置控制器 |
+| `cgroup.controllers` | 列出当前节点可为子层启用的控制器 |
+| `cgroup.subtree_control` | 选择当前节点用于管理直接子节点的控制器 |
+| `cgroup.procs` | 查看或迁移直接归属于节点的进程 |
+| 无内部进程约束 | 启用 domain 控制器的非根节点不能同时直接容纳进程 |
+| CPU 控制器 | 用 `cpu.weight` 分配竞争份额，用 `cpu.max` 设置公平调度带宽上限 |
+| 内存控制器 | 用 `memory.high` 施加回收与节流，用 `memory.max` 建立 OOM 硬边界 |
+| I/O 控制器 | 用 `io.max` 按块设备限制 BPS 和 IOPS |
+| PID 控制器 | 用 `pids.max` 限制 cgroup 层级中的任务数量 |
+| `css_set` | 表示任务完整 cgroup 归属组合，可由多个任务共享 |
+| `cgroup_subsys_state` | 控制器在某个 cgroup 节点上的通用状态结构 |
+| `cgroup_subsys` | 描述控制器并注册迁移、创建和退出等回调 |
 
-namespace 隔离视图（进程看到什么），cgroup 限制配额（进程能用多少）。两者正交：namespace 不限资源，cgroup 不隔视图。容器把两者叠加。namespace 让进程以为自己独占系统，cgroup 确保它不能真的独占。
+namespace 决定内核从哪个资源视图解释进程请求，cgroup 决定这些进程可以怎样竞争和消耗底层资源；只有同时建立视图边界与用量边界，容器隔离才具有可管理的运行时行为。
 
 ---
 
-**Linux 源码入口**：
-- [`kernel/cgroup/cgroup.c`](https://elixir.bootlin.com/linux/latest/source/kernel/cgroup/cgroup.c) — `cgroup_migrate()`、`cgroup_attach_task()`：进程在 cgroup 之间的迁移
-- [`kernel/cgroup/cgroup-v1.c`](https://elixir.bootlin.com/linux/latest/source/kernel/cgroup/cgroup-v1.c) — v1 兼容层
-- [`kernel/sched/core.c`](https://elixir.bootlin.com/linux/latest/source/kernel/sched/core.c) — CPU 控制器的调度集成
-- [`mm/memcontrol.c`](https://elixir.bootlin.com/linux/latest/source/mm/memcontrol.c) — 内存控制器：`mem_cgroup_charge()`、OOM 处理
-- [`kernel/cgroup/pids.c`](https://elixir.bootlin.com/linux/latest/source/kernel/cgroup/pids.c) — PID 控制器：`pids_can_fork()`
-
-:::practice 给 zish 加上隔离
-学完命名空间和 Cgroups，你已经掌握了 Linux 容器的两大支柱。现在可以给 zish 加上 Namespace 隔离和资源限制，让它变成一个简易容器。
-
-前往 [zish-03：隔离与移植](/zish/03-isolation) 继续实践。
-:::
+**Linux 源码与接口入口**：
+- [Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)：统一层级、控制器接口和委派规则
+- [`kernel/cgroup/cgroup.c`](https://github.com/torvalds/linux/blob/master/kernel/cgroup/cgroup.c)：层级管理、进程迁移与控制器启用
+- [`include/linux/cgroup-defs.h`](https://github.com/torvalds/linux/blob/master/include/linux/cgroup-defs.h)：`struct cgroup`、`css_set` 与 `cgroup_subsys_state`
+- [`kernel/cgroup/pids.c`](https://github.com/torvalds/linux/blob/master/kernel/cgroup/pids.c)：PID 控制器的层级计数与 `can_fork` 回调
+- [`kernel/sched/core.c`](https://github.com/torvalds/linux/blob/master/kernel/sched/core.c)：CPU 控制器与组调度
+- [`mm/memcontrol.c`](https://github.com/torvalds/linux/blob/master/mm/memcontrol.c)：内存记账、回收和 cgroup OOM
+- [`block/blk-cgroup.c`](https://github.com/torvalds/linux/blob/master/block/blk-cgroup.c)：块 I/O cgroup 基础设施

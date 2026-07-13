@@ -1,463 +1,264 @@
 # 命名空间
 
-- 写作时间：`2026-02-27 首次提交，2026-03-23 最近修改`
-- 当前字符：`19719`
+- 写作时间：`2026-02-27 首次提交，2026-07-13 最近修改`
+- 当前字符：`12202`
 
-前面几课讲的进程都生活在同一个世界里——共享同一套 PID 编号、同一个文件系统、同一个网络栈。但容器技术需要让每个容器觉得自己独占一台机器。来看一个实验：运行一条命令，观察进程看到的世界：
+[Linux 调度器](/process/05-linux-scheduler)解释了多个任务怎样共享处理器，但这些任务默认仍然看到同一套系统资源：同一组进程编号、同一棵挂载树、同一组网络设备和同一个主机名。容器首先要解决的不是资源分配，而是让一组进程获得受限且彼此一致的系统视图。
 
-```
-$ unshare --pid --fork --mount-proc bash
-$ echo $$
-1
-$ ps aux
-USER  PID  COMMAND
-root    1  bash
-```
+来看一个具体场景。某个服务在容器内调用 `getpid()` 得到 1，读取主机名得到 `web-1`，只看见容器自己的网络接口；宿主机却用另一个 PID 管理同一个服务，并能看见连接容器的虚拟网络接口。这里没有复制进程或内核，变化的是系统调用解释资源标识时采用的上下文。
 
-这个 bash 认为自己是 PID 1，`ps` 也只显示它一个进程。但从宿主机看，它的 PID 可能是 54321，周围有几百个进程。同一个进程，在不同视角下看到完全不同的 PID。
+命名空间(namespace)是 Linux 把一类全局系统资源包装成多个独立实例，并让进程关联其中一个实例的隔离机制。Linux 目前提供八类 namespace：Mount 隔离挂载视图，UTS 隔离主机标识，IPC 隔离部分进程间通信对象，PID 隔离进程编号，Network 隔离网络栈，User 隔离用户与权限上下文，Cgroup 隔离 cgroup 路径视图，Time 隔离部分系统时钟的偏移。
 
-这就是 namespace（命名空间）的效果。
-
-PID 编号空间本来是全局的：内核维护一张 PID 表，所有进程从中分配编号，互相可见。PID namespace 把这张全局表拆成多份，每个 namespace 各自维护独立的 PID 表，内部进程从 1 开始编号，看不到其他 namespace 的进程。
-
-Linux 中这样的全局资源不止 PID 一种。挂载点列表、网络栈、主机名、用户 ID 空间，都是所有进程默认共享的。namespace 对每种资源做同样的事：从「全局一份，所有进程共享」变成「每个 namespace 各一份，组内进程只看到自己那份」。Linux 有八种 namespace，每种隔离一类资源：
-
-| Namespace | 隔离的资源 | 内核版本 |
-|-----------|-----------|---------|
-| Mount | 文件系统挂载点 | 2.4.19 (2002) |
-| UTS | 主机名、域名 | 2.6.19 (2006) |
-| IPC | System V IPC、POSIX 消息队列 | 2.6.19 (2006) |
-| PID | 进程 ID 编号空间 | 2.6.24 (2008) |
-| Network | 网络设备、路由、端口、防火墙 | 2.6.29 (2009) |
-| User | 用户 ID、组 ID、capabilities | 3.8 (2013) |
-| Cgroup | cgroup 根目录视图 | 4.6 (2016) |
-| Time | CLOCK_MONOTONIC、CLOCK_BOOTTIME | 5.6 (2020) |
-
-八种原理相同，本篇聚焦与构建容器直接相关的五种：**PID** 隔离进程编号空间，**Mount** 隔离文件系统挂载点，**Network** 隔离网络栈，**User** 隔离用户 ID 与权限，**UTS** 隔离主机名。剩余三种（IPC、Cgroup、Time）不展开。知道了有哪些 namespace，下一个问题是怎么操作它们——内核提供三个系统调用：**clone** 在创建子进程时建立新 namespace，**unshare** 让当前进程脱离旧 namespace 进入新的，**setns** 加入一个已经存在的 namespace。最后看内核的 **nsproxy** 结构如何把一切串起来。
+本课先用 **PID** 说明同一个进程为什么能有多层编号，再用 **Mount** 说明进程怎样获得独立的文件系统视图。文件系统隔离后仍需要受控通信，因此继续分析 **Network**；网络和挂载操作又涉及权限检查，于是进入 **User**。较轻量的主机标识和其余类型放在 **UTS 与其余类型** 中统一说明。最后通过 **Namespace API** 连接创建、拆分与加入操作，再用 **内核表示** 解释一个进程怎样同时关联多类 namespace。
 
 ## PID
 
-PID namespace 隔离进程 ID 编号空间。不同 PID namespace 中的进程可以拥有相同的 PID 值。新 PID namespace 中的第一个进程获得 PID 1，成为该 namespace 的 init。
+PID namespace 是为一组进程提供独立进程编号视图的命名空间。
 
-一个进程在宿主机上是 PID 54321，在自己的 PID namespace 里却是 PID 1。内核怎么做到的？
+PID namespace 可以嵌套，最外层是系统启动时建立的初始 PID namespace。一个进程在自己所属的 namespace 中有一个 PID，在每个祖先 PID namespace 中也各有一个 PID。例如，同一个进程可能同时具有下面三个编号：
 
-先看一个具体场景。宿主机创建了 namespace A，A 里面又创建了 namespace B，B 里运行着一个 bash。PID namespace 可以嵌套，每一层各自维护独立的 PID 表。这个 bash 同时出现在三层的 PID 表中，编号各不相同：
-
-```
-                  PID     usage
-Host:             54321   host runs kill(54321, ...) to terminate it
-Namespace A:      89      A runs kill(89, ...) to manage it
-Namespace B:      1       bash calls getpid(), gets 1
+```text
+初始 PID namespace       PID 31420
+└── 租户 PID namespace   PID 87
+    └── 容器 PID namespace  PID 1
 ```
 
-三个编号指向同一个进程。
+祖先 namespace 中的进程能看见后代 namespace 中的进程，所以宿主机可以用 31420 管理它；容器内的进程只能看见本层及其后代，不能用 87 或 31420 访问祖先中的进程。`kill()`、`waitpid()` 等接收 PID 的接口，都按调用者所处 PID namespace 的编号解释参数。
 
-:::thinking 为什么 OS 要允许多层 namespace 嵌套？
-假设不嵌套，所有进程共享一个 PID 空间。想想云平台的场景：平台、租户、租户的服务全在一个 namespace 里。租户运行 `ps aux`，能看到平台的数据库（PID 42）、别的租户的 Web 服务（PID 200）。执行 `kill 42`，平台数据库没了；执行 `kill 200`，别的租户的服务也没了。这不行。
-
-这就是**隔离**。每个租户只能看到自己的进程，看不到平台，也看不到别的租户。隔离需求可以递归：租户内部还想隔离自己的服务，服务内部还想隔离子任务，每一层组织边界对应一层 namespace。
-
-但隔离不等于失控。平台要杀掉最内层的 bash，用 `kill(54321, ...)`；租户要停掉它，用 `kill(89, ...)`；bash 自己调 `getpid()` 得到 1。三个编号，三层视角，指向同一个进程。所以内核要为这一个进程同时记住三个 PID。
-
-:::
-
-
-内核把一对 (编号, 所属 namespace) 叫做 `upid`（namespace-level PID），把一个进程在所有层的 `upid` 集合叫做 `struct pid`。对于上面的 bash，它的 `struct pid` 存了三个 `upid`：
+内核用 `struct pid` 保存这种多层身份。`numbers[]` 中的每个 `struct upid` 都把一个数值与它所属的 PID namespace 配对：
 
 ```c
-// include/linux/pid.h
-struct upid {                   // unit pid: one PID number in one namespace layer
-    int nr;                     // nr = number, the PID value
-    struct pid_namespace *ns;   // which namespace layer this number belongs to
+/* include/linux/pid.h, trimmed */
+struct upid {
+    int nr;
+    struct pid_namespace *ns;
 };
 
-struct pid {                    // complete PID identity: all layers combined
-    unsigned int level;         // deepest layer index (here: 2)
-    struct upid numbers[];      // one upid per layer
-    // numbers[0] = { 54321, Host }
-    // numbers[1] = { 89,    Namespace A }
-    // numbers[2] = { 1,     Namespace B }
+struct pid {
+    refcount_t count;
+    unsigned int level;
+    /* task lists and lifetime fields omitted */
+    struct upid numbers[];
 };
 ```
 
-`getpid()` 返回 `numbers[level].nr`，即最内层的编号（这里是 1）。宿主机通过 `numbers[0].nr` 看到 54321。没有哪一层的 PID 是「真实」的，每层地位平等。
+这里的“同一个进程有多个 PID”不是说 PID 值会随时变化，而是每一层拥有自己的编号。进程所属的活动 PID namespace 在创建时确定，之后不能改变；`getpid()` 返回的是进程的线程组 ID 在该层中的可见编号。Linux 将 PID namespace 的最大嵌套深度限制为 32 层。
 
-每个 PID namespace 的 PID 1 充当该 namespace 的 init，具备三个特殊行为：
+新 PID namespace 中创建的第一个进程获得 PID 1，称为 namespace init。它有三项特殊语义：
 
-**信号屏蔽。** 和真正的 init 一样，namespace 内的其他进程只能向 PID 1 发送 PID 1 已注册处理函数的信号。如果 PID 1 没有注册 SIGTERM 的处理函数，`kill(1, SIGTERM)` 会被内核直接丢弃。这防止 namespace 内的进程误杀 init。但来自祖先 namespace 的 SIGKILL 和 SIGSTOP 不受此限，父 namespace 拥有控制权。
+- **信号保护**：同一 PID namespace 中的其他进程，只能向 PID 1 发送它已经注册处理函数的信号。祖先 namespace 仍可在权限检查通过后发送信号，其中 `SIGKILL` 和 `SIGSTOP` 会被强制投递。
+- **孤儿回收**：进程退出而留下后代时，内核优先把孤儿重新挂到最近的 child subreaper；如果没有这样的进程，再交给相关 PID namespace 的 init。init 必须调用 `wait()` 一类接口回收退出状态，否则会积累僵尸进程。
+- **生命周期约束**：namespace init 退出后，内核向该 PID namespace 中的其余进程发送 `SIGKILL`，并拒绝继续在其中创建进程。即使某个文件描述符仍引用该 namespace 对象，对它执行后续 `fork()` 也会失败；因此“PID 1 退出”不等于对象引用立即消失，但这组进程已经不能继续运行。
 
-**孤儿收养。** namespace 内的进程变成孤儿时（父进程退出），被重新挂到 PID 1 下面。PID 1 必须 `wait()` 这些子进程，否则它们变成僵尸。这是容器中一个常见的坑：用普通应用程序作为 PID 1（它不调用 `wait()`），导致僵尸进程堆积。解决方案是在容器中使用轻量 init（如 `tini` 或 `dumb-init`）。
+`ps` 并不直接询问“当前 PID namespace 有哪些进程”，而是读取 procfs 中的 `/proc/PID` 目录。procfs 是由内核动态生成内容的虚拟文件系统；一次 procfs 挂载会绑定到执行挂载操作的进程所见的 PID namespace，并只展示该视角可见的进程。因此，创建 PID namespace 后通常还要创建独立的挂载视图，再在其中挂载新的 `/proc`：
 
-**namespace 终结。** PID 1 退出时，内核向 namespace 内所有剩余进程发送 SIGKILL，然后标记 namespace 为不可用，不能再在其中创建新进程。换句话说，PID 1 一退出，整个容器就被销毁了。所以要确保容器的主进程（就是那个 PID 1）不能意外退出，否则容器里所有服务会被一起杀掉。
-
-PID namespace 还影响 `ps` 命令的输出。`ps` 的数据来源是 `/proc` 目录，这个目录是 per-namespace 的。进入新 PID namespace 后，如果不重新挂载 `/proc`，`ps` 读到的仍然是宿主机的 `/proc`，会显示宿主机的进程（错误的信息）。所以创建 PID namespace 后通常需要同时创建 Mount namespace，然后：
-
-:::expand /proc
-
-进程的状态、内存映射、打开的文件等信息都在内核里，用户态程序没法直接访问内核内存。内核需要提供一种方式让用户态能读到这些信息。Linux 的做法是 `/proc`：一个虚拟文件系统，不占磁盘空间，内容由内核动态生成。每个进程在 `/proc` 下有一个以 PID 命名的子目录（如 `/proc/1234`），用户态程序用普通的文件读取操作（`open` + `read`）就能获取内核中的进程信息。`ps`、`top` 这些工具的底层就是在读 `/proc` 下的文件。
-
-:::
-
-```bash
+```sh
 mount -t proc proc /proc
 ```
 
-新挂载的 `/proc` 只显示当前 PID namespace 中的进程。`/proc/self` 指向 namespace 内的 PID（如 1）。这也是开篇例子中 `--mount-proc` 参数的作用。
-
-PID namespace 最大嵌套深度：32 层（`MAX_PID_NS_LEVEL`）。
+如果继续使用宿主机原有的 procfs 挂载，`ps` 读取的仍是旧视角。PID 隔离本身没有自动替换 `/proc`，进程编号视图与独立挂载视图必须在这里配合。
 
 ## Mount
 
-Mount namespace 隔离文件系统挂载点列表。不同 Mount namespace 中的进程看到不同的挂载表。在一个 namespace 内挂载或卸载文件系统，不影响其他 namespace。
+Mount namespace 是为一组进程提供独立挂载列表和目录层次视图的命名空间。
 
-这是最早加入内核的 namespace 类型（2002 年）。创建新 Mount namespace 时，当前的挂载表被**复制**一份到新 namespace。之后两边各自独立。
+挂载(mount)是把一个文件系统的目录树接入某个目录路径的操作，接入位置称为挂载点。创建 Mount namespace 时，内核以调用者当前的挂载列表初始化新实例；此后，一侧执行 `mount()` 或 `umount()` 通常只改变自己的挂载视图。
 
-容器需要让进程看到一个完全不同的根文件系统。Linux 提供了两个系统调用来做这件事：`chroot` 和 `pivot_root`。
+“通常”这一限制来自挂载传播(mount propagation)。挂载点带有传播类型，它决定某个挂载事件是否在相关挂载点之间同步：
 
-**`chroot(path)`** 把当前进程的根目录（`/`）指向 `path`。比如 `chroot("/container/rootfs")` 之后，进程访问 `/bin/sh` 实际访问的是宿主机上的 `/container/rootfs/bin/sh`。看起来进程已经被关在一个新的文件系统里了，但实际上宿主机的文件系统还在，`chroot` 只是改变了进程自己对 `/` 的理解，并没有把宿主机的文件系统卸载掉。特权进程可以通过 `chroot()` + `fchdir()` 组合逃逸回宿主机的真实根目录。`chroot` 的设计初衷是打包构建，不是安全隔离。
+| 类型 | 传播语义 |
+|------|----------|
+| shared | 与同一 peer group 中的挂载点双向传播事件 |
+| private | 不向外传播，也不接收其他挂载点的事件 |
+| slave | 接收 master 一侧的事件，但自身事件不反向传播 |
+| unbindable | 具有 private 语义，并禁止作为绑定挂载的源 |
 
-**`pivot_root(new_root, put_old)`** 做得更彻底。还是用 `/container/rootfs` 这个例子：`pivot_root("/container/rootfs", "/container/rootfs/.put_old")` 执行后，`/container/rootfs` 变成新的 `/`，而原来的宿主机根目录被挪到了 `/.put_old` 下面。此时进程访问 `/.put_old` 还能看到宿主机的文件。但接下来执行 `umount /.put_old`，宿主机的文件系统就从当前 namespace 的目录树上断开了。文件还在磁盘上（宿主机照常访问），但这个 namespace 里的进程再也访问不到。和 `chroot` 的区别在于：`chroot` 只是让进程「以为」根目录变了，宿主机文件系统还挂在目录树上；`pivot_root` 配合 `umount` 是真的把宿主机文件系统从目录树上摘掉了。
+绑定挂载(bind mount)把一棵已经存在的目录树接到另一个路径，不会为文件内容创建副本。peer group 是一组共享挂载事件的挂载点。新 Mount namespace 虽然复制了挂载列表，但其中的 shared 挂载仍可能与其他 namespace 传播事件。容器运行时在重建根文件系统前，通常会把相关子树递归改为 private 或 slave，避免容器内的挂载操作影响宿主机。
 
-容器运行时（runc 等）用 `pivot_root`，不用 `chroot`。典型流程：
+独立挂载视图还不等于已经切换根文件系统。`chroot(path)` 只修改进程进行绝对路径解析时采用的根目录，不会创建 Mount namespace，也不会自动卸载旧根文件系统。若进程保留指向外部目录的当前工作目录或文件描述符，并且仍有足够权限，单独使用 `chroot()` 不能构成完整的安全边界。
 
-```bash
-mount --bind /path/to/rootfs /path/to/rootfs   # bind mount new root
-cd /path/to/rootfs
-mkdir .put_old
-pivot_root . .put_old                           # swap root
-umount -l /.put_old                             # unmount old root
-rmdir /.put_old
-mount -t proc proc /proc                        # mount new /proc
-```
+`pivot_root(new_root, put_old)` 改变的是当前 Mount namespace 的根挂载：`new_root` 成为新的 `/`，旧根被移动到新根下的 `put_old`。随后卸载旧根，并清理仍指向旧目录树的工作目录和文件描述符，进程才不再能通过这棵挂载树访问宿主机根目录。容器运行时可以使用 `pivot_root()`，也可以使用较新的挂载 API 组合完成等价的根挂载切换；关键不在某个固定命令，而在于旧根是否从容器的挂载视图和可达引用中移除。
 
-:::expand 挂载传播
-
-Mount namespace 创建时复制父 namespace 的挂载表。但之后父 namespace 里的新挂载是否传播到子 namespace？取决于挂载传播类型。用 `mount` 命令设置：
-
-| 类型 | 设置命令 | 行为 |
-|------|---------|------|
-| shared | `mount --make-shared /mnt` | 挂载事件双向传播 |
-| private | `mount --make-private /mnt` | 不传播（容器默认） |
-| slave | `mount --make-slave /mnt` | 单向：从父 namespace 接收，不回传 |
-| unbindable | `mount --make-unbindable /mnt` | private + 不可被 bind mount |
-
-举个例子：如果 `/mnt` 是 shared 的，在父 namespace 里执行 `mount /dev/sdb /mnt/usb`，子 namespace 里也会自动出现 `/mnt/usb`。如果是 private 的，子 namespace 完全不受影响。
-
-容器运行时通常在创建 Mount namespace 后把所有挂载递归设为 private（`mount --make-rprivate /`），防止容器内的挂载操作泄漏到宿主机。
-
-:::
+Mount namespace 只隔离“哪些文件系统挂在哪里”。文件自身的用户 ID(User ID, UID)、组 ID(Group ID, GID)和访问权限仍由文件系统与进程凭据检查，磁盘块和页缓存也可能由多个 namespace 共享。它提供的是挂载视图隔离，不是文件内容的自动复制。
 
 ## Network
 
-Network namespace 隔离整个网络栈：网络设备、IPv4/IPv6 协议栈、路由表、防火墙规则、端口号空间、`/proc/net`、`/sys/class/net`。
+Network namespace 是包含独立网络设备、协议栈状态、路由表、防火墙规则和端口空间的命名空间。
 
-新创建的 Network namespace 只有一个 loopback 接口（`lo`），而且默认是 **down** 的。没有路由、没有防火墙规则、没有任何连接。从零开始，这才是真正的隔离。
+套接字在创建时关联当前 Network namespace，因此两个 namespace 可以分别在同一个端口号上监听而不冲突。`/proc/net`、`/sys/class/net` 和部分 `/proc/sys/net` 配置也按 Network namespace 提供视图。新实例只有一个默认未启用的 `lo` 设备；`lo` 是只在本网络栈内部收发数据的回环接口。没有额外设备和路由时，新实例不能与外部通信。
 
-但完全隔离的容器没有用处，它至少要能和宿主机通信（比如对外提供 Web 服务）。问题是：两个 Network namespace 各自有独立的网络栈，怎么把它们连起来？Linux 提供了 veth（virtual ethernet）设备来解决这个问题。veth 总是成对创建，可以理解为一根虚拟网线的两端：数据从一端进去，从另一端出来。把一端放进容器的 Network namespace，另一端留在宿主机，两个网络栈就连通了。我们在宿主机上用`ip`这个工具创建 veth 对，把一端移入容器，给两端分配 IP 地址并启用：
+虚拟以太网设备对(veth pair)是成对创建的两个网络接口：一端发送的以太网帧会从另一端接收。把一端留在初始 Network namespace，另一端移入容器，就能在两个网络栈之间建立数据路径：
 
-```bash
-# create veth pair
-ip link add veth-host type veth peer name veth-container
+```text
+容器 Network namespace                  初始 Network namespace
 
-# move one end into container's Network namespace (assuming container init PID = 1234)
-ip link set veth-container netns 1234
-
-# host side configuration
-ip addr add 10.0.0.1/24 dev veth-host
-ip link set veth-host up
-
-# container side configuration
-nsenter --target 1234 --net -- ip addr add 10.0.0.2/24 dev veth-container
-nsenter --target 1234 --net -- ip link set veth-container up
-nsenter --target 1234 --net -- ip link set lo up
+eth0 10.0.0.2
+      │
+      └── veth-container ⇄ veth-host ── bridge ── 路由/NAT ── 物理网卡
 ```
 
-现在宿主机和容器可以互相 ping。但容器还不能访问外部网络（比如 `curl google.com`），因为 veth 只连接了容器和宿主机，外部网络不知道容器的 IP 地址。要解决这个问题，需要在宿主机上配置桥接和 NAT。Docker 的默认网络就是这个原理：创建 `docker0` 桥接设备，每个容器的 veth 一端接到桥上，通过 iptables MASQUERADE 规则做出站 NAT。
+网桥(bridge)是根据以太网帧中的媒体访问控制地址(Media Access Control address, MAC)转发帧的网络设备。多个容器的宿主机侧 veth 接入同一个网桥后，可以处于同一个以太网链路中。网络地址转换(Network Address Translation, NAT)则在数据包经过宿主机时改写地址或端口，并保存反向转换所需的连接状态；容器使用私有地址访问外部网络时，常用源地址转换把容器地址替换为宿主机可路由的地址。
 
-:::expand 桥接与 NAT
+网桥、路由和 NAT 都不是 namespace 自动创建的功能。namespace 先建立网络隔离，管理员或容器运行时再显式配置允许的连接，这样才能区分“拥有独立网络栈”和“能够访问哪些网络”。
 
-这两个概念可以用家庭网络来理解。家用路由器其实是三个东西的组合：交换机 + 路由 + NAT。
-
-**交换机（switch）** 负责局域网内部互联。家里的手机、电脑、电视都连到路由器上，路由器内部的交换机根据 MAC 地址把数据转发给目标设备，让它们之间能互相通信。Docker 里的 `docker0` bridge 就是一个虚拟交换机：每个容器的 veth 宿主机端接到 bridge 上，所有容器就组成了一个局域网。没有 bridge 的话，3 个容器互联需要 3 对 veth（A↔B、A↔C、B↔C）；有了 bridge，每个容器只需要一对 veth 接到 bridge 上，bridge 负责内部转发。
-
-**NAT（Network Address Translation）** 负责连接外部网络。家里的设备用的是内部 IP（如 `192.168.1.x`），外部网络不认识这些地址。路由器把出站数据包的源 IP 从内部 IP 替换成路由器自己的外部 IP，再转发出去。外部服务器看到的是路由器的 IP，回复也发给路由器，路由器再根据记录转回给对应的设备。Docker 做的事一模一样：容器用内部 IP（如 `10.0.0.x`），宿主机通过 iptables MASQUERADE 规则做出站 NAT，把容器的内部 IP 替换成宿主机的外部 IP。
-
-:::
-
-除了 veth，还可以把宿主机上的物理网卡（如 `eth0`）直接移入容器的 Network namespace（`ip link set eth0 netns 1234`）。这样容器就独占这块网卡，不经过 bridge 和 NAT，直接收发网络数据，性能更高。这种方式适合对网络性能要求高的场景，比如运行数据库或高频交易服务。代价是：物理网卡同一时刻只能属于一个 Network namespace，移入容器后宿主机就用不了这块网卡了。容器销毁时，网卡会自动回到宿主机的 namespace。
+物理网络设备同一时刻只能属于一个 Network namespace；namespace 释放时，其中的物理设备会回到初始 Network namespace，veth 设备则随实例销毁。这个规则说明 Network namespace 隔离的是网络对象的归属，不是为每个容器复制一份真实硬件。
 
 ## User
 
-User namespace 隔离用户 ID、组 ID 和 capabilities（能力）。
+User namespace 是隔离 UID、GID 以及 Linux 权能作用范围的命名空间。
 
-每个进程都有一个 UID（用户 ID），内核根据 UID 决定这个进程能访问哪些文件、能不能绑定 80 端口、能不能加载内核模块。正常情况下 UID 是全局的：UID 0 就是 root，在整个系统里什么都能做。
+UID 和 GID 分别表示用户身份与组身份。Linux 权能(capability)把传统 root 权限拆成 `CAP_SYS_ADMIN`、`CAP_NET_ADMIN` 等独立权限位，内核在执行特权操作时检查调用线程是否在正确的 User namespace 中拥有所需权能。
 
-传统 Unix 的权限模型很粗暴：要么是 root 什么都能做，要么是普通用户处处受限。Linux capabilities 把 root 的权力拆分成了大约 40 个独立的小权限，比如：
+一个进程可以在子 User namespace 中是 UID 0，同时在父 namespace 中映射为普通 UID。映射通过 `/proc/PID/uid_map` 和 `/proc/PID/gid_map` 表达，每行包含三个数字：
 
-| capability | 允许的操作 |
-|-----------|-----------|
-| `CAP_NET_BIND_SERVICE` | 绑定 1024 以下的端口（如 80、443） |
-| `CAP_SYS_ADMIN` | 挂载文件系统、创建 namespace 等 |
-| `CAP_NET_RAW` | 使用原始套接字（如 `ping`） |
-| `CAP_KILL` | 向任意进程发信号 |
-
-这样就可以做到精细控制：一个 Web 服务器只需要 `CAP_NET_BIND_SERVICE` 就能绑定 80 端口，不需要给它完整的 root 权限。容器运行时通常只给容器少量必要的 capabilities，而不是完整的 root。
-
-User namespace 把 UID 和 capabilities 都变成 per-namespace 的：一个进程在自己的 User namespace 内部看到的 UID 是 0（root），但这个 0 映射到宿主机上可能是 UID 1000，一个普通用户。容器里的程序以为自己是 root，可以装软件、改配置，但如果它突破了容器边界，在宿主机上只有普通用户的权限。
-
-:::thinking User namespace 和 PC 上的多用户（比如 Linux 上有多个账号）是同一个机制吗？
-
-不是。PC 多用户是传统的 Unix 用户系统：每个用户有一个 UID（你是 1000，另一个用户是 1001），所有用户共享同一个 UID 空间，内核根据 UID 判断谁能访问什么文件。这个机制从 Unix 诞生就有了，不涉及 namespace。User namespace 是在这个基础上再加一层：创建隔离的 UID 空间。同一个进程在 namespace 内部看到自己的 UID 是 0，但在宿主机上它的 UID 是 1000。多用户是「同一个空间里有不同的人」，User namespace 是「多个平行空间，同一个人在不同空间里有不同身份」。
-
-两者的全面对比：
-
-|  | 多用户 | namespace |
-|--|--------|-----------|
-| 隔离方式 | 权限控制：不同用户有不同的读写权限 | 可见性隔离：不同 namespace 看到完全不同的资源 |
-| 进程可见性 | 所有用户都能看到系统上的所有进程（`ps aux`） | 不同 PID namespace 的进程互相看不到 |
-| 文件系统 | 共享同一个文件系统，靠文件权限控制访问 | 可以有完全不同的根文件系统（`pivot_root`） |
-| 网络 | 共享同一个网络栈和端口空间 | 每个 Network namespace 有独立的网络栈 |
-| 攻击面 | 用户 A 能看到用户 B 的进程，可以尝试攻击 | 容器 A 根本不知道容器 B 的存在 |
-| 典型场景 | 一台 Linux 服务器上多个开发者共用 | 云平台上不同租户的容器 |
-
-一句话总结：多用户靠「不让你动」，namespace 靠「不让你看到」。
-
-:::
-
-User namespace 有一个独特属性：它是**唯一一种不需要 root 权限就能创建的 namespace**（从 Linux 3.8 开始）。创建其他类型的 namespace（PID、Mount、Network 等）都需要 root 权限，但创建 User namespace 不需要。进程进入新的 User namespace 后，在里面获得完整的 root 权限（capabilities），然后用这个权限去创建其他类型的 namespace。这使得普通用户也能创建容器（rootless container）：用一个不需要特权的 namespace 来引导其他需要特权的 namespace。
-
-回想一下前面几节：创建 PID namespace、Mount namespace、Network namespace 都需要 `CAP_SYS_ADMIN`，也就是 root 权限。在 User namespace 出现之前，普通用户没有任何途径获得这些 capabilities，所以 Docker 只能以 root 身份运行。这意味着 Docker 守护进程本身就是一个 root 进程，它的任何漏洞都是 root 级别的安全风险。有了 User namespace，普通用户可以先创建 User namespace（不需要 root），在里面获得 capabilities，再创建其他 namespace。整个过程不需要真正的 root，即使容器运行时被攻破，攻击者在宿主机上也只有普通用户的权限。
-
-namespace 内部和宿主机之间的 UID 映射关系可以通过 `/proc/[pid]/uid_map` 和 `/proc/[pid]/gid_map` 配置，直接用 `echo` 往里写：
-
-```bash
-# container init PID = 1234
-# map UID 0 inside namespace to UID 1000 outside, range 1
-echo "0 1000 1" > /proc/1234/uid_map
+```text
+namespace 内起始 ID    父 namespace 起始 ID    连续数量
+0                      1000                    1
+1                      100000                  65535
 ```
 
-格式是 `<namespace内ID> <namespace外ID> <范围长度>`。上面这条的意思是：namespace 内的 UID 0 对应宿主机的 UID 1000，只映射 1 个 UID。容器里的 root 在宿主机上其实是 UID 1000，一个普通用户。
+第一行把内部 UID 0 映射为父层 UID 1000；第二行把内部 1 到 65535 映射为父层 100000 到 165534。内核在访问父层文件等对象时会沿映射转换身份，因此内部 root 并不会自动变成初始 User namespace 的 root。
 
-映射规则：
+创建新 User namespace 的进程会在新实例中获得完整 capability 集合，但这些能力只支配该 User namespace 拥有的资源。例如，新建的 Mount namespace 会记录创建它的 User namespace；在其中执行挂载操作时，内核检查调用者在这个拥有者 User namespace 中的 capability。加载内核模块、改变宿主机系统时间等不受子 User namespace 管辖的操作，仍要求初始 User namespace 中的权限。
 
-- 每个映射文件只能写入**一次**（写完不可修改）
-- 非特权用户只能映射自己的 UID/GID（单行，范围长度 1）
-- 写 `gid_map` 前必须先向 `/proc/[pid]/setgroups` 写入 `"deny"`（安全措施）
-- 最大 340 行映射（Linux 4.15+）
-- User namespace 最大嵌套深度：32 层
+Linux 接口允许没有父层权能的进程创建 User namespace，但发行版可以通过内核配置或安全策略限制这项能力。若一次 `clone()` 或 `unshare()` 同时指定 `CLONE_NEWUSER` 和其他 `CLONE_NEW*` 标志，内核先创建 User namespace，使调用者能够在新 User namespace 的权限范围内创建由它拥有的其他 namespace。这是无 root 容器(rootless container)的基础：运行时和容器进程不需要取得初始 User namespace 的 root 权限。
 
-:::expand 安全提示
+ID 映射本身仍受约束。映射文件只能成功写入一次，区间不能重叠；缺少父 User namespace 中 `CAP_SETUID` 或 `CAP_SETGID` 的进程，通常只能直接写入一行，把自己的有效 ID 映射进子 namespace。为普通用户分配更大范围时，系统先在 `/etc/subuid` 和 `/etc/subgid` 中授权从属 ID(subordinate ID)区间，再由 `newuidmap`、`newgidmap` 这类受控辅助程序写入。写 `gid_map` 前还可能需要向 `setgroups` 文件写入 `deny`，防止组权限映射绕过访问检查。
 
-User namespace 带来了一个安全隐患。内核里有很多代码路径（配置防火墙、挂载文件系统等）以前只有 root 才能触发。这些代码即使有 bug，也被归为低危，因为触发条件本身就需要 root，而 root 已经什么都能做了。User namespace 改变了这个前提：普通用户创建 User namespace 获得内部 root，再创建 Network namespace 或 Mount namespace，就能触发那些以前只有真正 root 才能碰到的内核逻辑。原来的低危 bug 一夜之间变成了高危提权漏洞，bug 本身没变，变的是谁能触发它。
+因此，User namespace 改变的是“某项 capability 在哪个资源范围内有效”，而不是让权限检查消失。容器内显示 UID 0，只能说明它在本层的身份，不能单独证明它拥有宿主机权限。
 
-[CVE-2024-1086](https://nvd.nist.gov/vuln/detail/CVE-2024-1086) 就是一个典型案例：netfilter（内核防火墙）有一个内存释放后使用的 bug，正常情况下只有 root 能配置 netfilter，普通用户碰不到。但通过 User namespace + Network namespace，普通用户就能在里面配置 netfilter 触发这个 bug，最终获得宿主机的真正 root 权限。拿到 root 之后，攻击者可以读取 `/etc/shadow` 获取所有用户的密码哈希，安装 rootkit 隐藏自己的进程让管理员发现不了，植入 SSH 后门保持长期访问，或者在云平台场景下从一个容器逃逸到宿主机，进而访问同一台物理机上所有其他租户的容器和数据。2024 年 Leaky Vessels 漏洞（[CVE-2024-21626](https://nvd.nist.gov/vuln/detail/CVE-2024-21626)）就是一个容器逃逸的真实案例，攻击者利用 runc 的一个文件描述符泄漏，从容器内部获得了宿主机文件系统的访问权限。
+## UTS 与其余类型
 
-类似的还有 [CVE-2023-0386](https://nvd.nist.gov/vuln/detail/CVE-2023-0386)（OverlayFS 漏洞）。部分发行版因此默认禁用非特权 User namespace（`kernel.unprivileged_userns_clone=0`），Ubuntu 23.10+ 通过 AppArmor 限制只允许特定程序使用。
+UTS、IPC、Cgroup 与 Time namespace 分别隔离主机标识、部分进程间通信对象、cgroup 路径视图和部分系统时钟。
 
-:::
+UTS namespace 保存 hostname 和网络信息服务(Network Information Service, NIS)的域名。hostname 是 `uname()`、`gethostname()` 等接口返回的主机标识，应用常把它写入日志或服务实例信息。不同 UTS namespace 可以设置不同 hostname；这不会自动在域名系统(Domain Name System, DNS)中创建记录，也不会改变 Network namespace 中的地址和路由。修改 hostname 仍需在拥有该 UTS namespace 的 User namespace 中通过相应权能检查。
 
-## UTS
+其余三类 namespace 解决更专门的视图隔离问题：
 
-UTS namespace 隔离主机名（hostname）和 NIS 域名（domainname）。"UTS" 是 "UNIX Time-Sharing" 的缩写，来源于 `uname()` 使用的结构体名称。
+| 类型 | 隔离内容 | 不负责的内容 |
+|------|----------|--------------|
+| IPC | System V 共享内存、信号量、消息队列以及 POSIX 消息队列 | 匿名管道、文件描述符和普通文件 |
+| Cgroup | 进程看到的 cgroup 根和路径 | CPU、内存等资源配额本身 |
+| Time | `CLOCK_MONOTONIC`、`CLOCK_BOOTTIME` 等时钟相对初始 namespace 的偏移 | `CLOCK_REALTIME` 所表示的系统墙上时间 |
 
-隔离主机名有什么用？很多应用程序会把主机名写进日志、上报给监控系统，或者用于服务发现。如果同一台宿主机上跑着 10 个容器，它们共享同一个主机名，日志里全是 `myhost`，根本分不清哪条日志来自哪个容器。有了 UTS namespace，每个容器可以有自己的主机名。Docker 默认把容器的主机名设为容器 ID 的短形式（如 `a1b2c3d4`），这样日志和监控一眼就能区分。
+IPC 表示进程间通信；表中的共享内存、信号量和消息队列都是由内核维护的具名 IPC 对象。Cgroup namespace 只改变进程观察 cgroup 层级时采用的根，不替代 [cgroups](/process/07-cgroup) 的控制器。Time namespace 通过偏移量让迁移或恢复后的进程保持合适的单调时钟视图，并不让容器任意修改宿主机实时时钟。
 
-这是最简单的 namespace 类型。创建时复制父 namespace 的值，之后各自独立：
+这四类对象共同说明 namespace 没有统一的“复制系统”语义。UTS 初始化一组名称，IPC 创建独立对象集合，Cgroup 改写路径视角，Time 保存时钟偏移；共同点只是系统调用会根据进程关联的 namespace 对象解释资源。
 
-```bash
-hostname                  # myhost
-unshare --uts bash
-hostname container-1
-hostname                  # container-1 (only within this namespace)
-# after exit, back to host
-hostname                  # myhost (unaffected)
-```
+## Namespace API
 
-## namespace 操作
+Namespace API 是 Linux 用于创建新 namespace、拆分共享关系和加入已有 namespace 的接口集合。
 
-我们可以通过三个系统调用来操作 namespace，分别对应三种场景：创建子进程时隔离、当前进程脱离、加入已有 namespace。
+三个核心接口对应三种操作：
 
-`clone()` 是 `fork()` 的通用形式。`fork()` 等价于 `clone(SIGCHLD, 0)`，子进程共享父进程的所有 namespace。加上 `CLONE_NEW*` 标志，子进程就会进入新建的 namespace：
-
-```c
-// create a child in new PID + Mount + UTS namespaces
-int flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD;
-pid_t pid = clone(child_fn, stack + STACK_SIZE, flags, arg);
-```
-
-容器运行时用一次 `clone()` 调用把所有需要的 `CLONE_NEW*` 标志 OR 在一起，一次性创建多个 namespace。
-
-每种 namespace 标志的权限要求：
-
-| 标志 | 要求 |
+| 接口 | 作用 |
 |------|------|
-| `CLONE_NEWUSER` | 无需特权（唯一例外） |
-| 其他所有 `CLONE_NEW*` | 需要 `CAP_SYS_ADMIN` |
+| `clone()` / `clone3()` | 创建子任务，并按 `CLONE_NEW*` 标志让子任务进入新 namespace |
+| `unshare()` | 让调用者不再共享指定执行上下文，通常创建新 namespace 并切入其中 |
+| `setns()` | 通过 namespace 文件描述符，让调用线程关联已有 namespace |
 
-`unshare()` 让当前进程进入新 namespace，不创建子进程：
-
-```c
-unshare(CLONE_NEWNS | CLONE_NEWUTS);
-// caller is now in new Mount + UTS namespaces
-```
-
-有两个例外，容易踩坑：`CLONE_NEWPID` 和 `CLONE_NEWTIME` **不移动调用者**。`unshare(CLONE_NEWPID)` 只设置 `pid_ns_for_children`，之后创建的子进程才会在新 PID namespace 中。原因：进程的 PID 一旦分配就不能改变。
-
-命令行工具 `unshare` 封装了这个系统调用：
-
-```bash
-unshare --pid --fork --mount-proc bash
-```
-
-`--fork` 参数的原因就是上面说的：`unshare(CLONE_NEWPID)` 不影响调用者，需要 fork 一个子进程才能进入新 PID namespace。
-
-`setns()` 让当前进程加入一个**已存在**的 namespace。它的第一个参数不是 PID，而是一个指向 namespace 的文件描述符。这是因为 namespace 是一个独立的内核对象，不属于某个特定进程（多个进程可以在同一个 namespace 里）。`/proc/1234/ns/net` 这个文件指向的是进程 1234 所在的 Network namespace 对象，`open` 拿到的 fd 引用的是那个 namespace 本身：
+glibc 的 `clone()` 包装函数和两个直接操作接口具有下面的 C 签名：
 
 ```c
-int fd = open("/proc/1234/ns/net", O_RDONLY);  // get a reference to the namespace, not to process 1234
-setns(fd, CLONE_NEWNET);                        // move current process into that namespace
+#define _GNU_SOURCE
+#include <sched.h>
+
+int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...);
+int unshare(int flags);
+int setns(int fd, int nstype);
+```
+
+`CLONE_NEWPID`、`CLONE_NEWNS`、`CLONE_NEWNET`、`CLONE_NEWUSER` 和 `CLONE_NEWUTS` 分别请求本课讨论的五类新实例。`clone()` 与 `fork()` 都进入内核的任务创建路径，但它们不是简单的固定参数替换关系：glibc 包装函数的调用约定、不同架构的原始系统调用以及 `clone3()` 的结构化参数都不相同。对 namespace 而言，关键语义是 `CLONE_NEW*` 标志决定子任务是否新建相应实例。
+
+PID namespace 是 `unshare()` 和 `setns()` 的特殊情况。进程自己的 PID 身份一旦建立就不能改变，因此 `unshare(CLONE_NEWPID)` 只设置以后创建的子进程所用的 PID namespace；对 PID namespace 文件描述符调用 `setns()` 也只影响后续子进程，而且目标只能是当前 PID namespace 本身或其后代。命令行工具 `unshare --pid --fork ...` 需要额外创建子进程，原因正在这里。
+
+`setns()` 的第一个参数通常来自 `/proc/PID/ns/TYPE`。这些路径是指向 namespace 对象的特殊链接，打开后得到的文件描述符持有对象引用：
+
+```c
+int fd = open("/proc/1234/ns/net", O_RDONLY | O_CLOEXEC);
+if (fd == -1)
+    /* handle errno */;
+
+if (setns(fd, CLONE_NEWNET) == -1)
+    /* handle errno */;
+
 close(fd);
 ```
 
-每个进程的 `/proc/[pid]/ns/` 下可以看到它所属的所有 namespace：
+链接显示的 `TYPE:[inode]` 中，inode 是文件系统用来标识对象的内核记录，这里的 inode 编号标识一个 namespace 实例。两个进程对应类型的编号相同，表示它们关联同一个实例。保持文件描述符打开，或者对该链接建立绑定挂载，可以让 namespace 在没有成员进程时继续存在；`nsenter` 和 `ip netns` 等工具正是利用这类接口管理现有实例。
 
-```
-$ ls -l /proc/self/ns/
-lrwxrwxrwx ... mnt -> mnt:[4026531841]
-lrwxrwxrwx ... pid -> pid:[4026531836]
-lrwxrwxrwx ... net -> net:[4026532008]
-lrwxrwxrwx ... user -> user:[4026531837]
-lrwxrwxrwx ... uts -> uts:[4026531838]
-...
-```
+权限检查并不只看调用者是不是 UID 0。每个非 User namespace 都记录一个拥有它的 User namespace，`clone()`、`unshare()` 和 `setns()` 会根据 namespace 类型、目标关系以及调用者在相关 User namespace 中的 capability 判断是否允许操作。
 
-方括号中的数字是 inode 编号，唯一标识一个 namespace 实例。如果两个进程的 `net` inode 相同，说明它们在同一个 Network namespace 中。
+## 内核表示
 
-命令行工具 `nsenter` 封装了 `setns()`，用于进入容器调试：
+namespace 的内核表示是 `task_struct` 通过 `nsproxy`、进程凭据和 PID 对象关联各类 namespace 实例的引用关系。
 
-```bash
-nsenter --target 1234 --pid --net --mount bash
-```
-
-namespace 通常在其中所有进程退出后销毁。两种方式让 namespace 在无进程时存活：保持 `/proc/[pid]/ns/` 文件的 fd 不关闭，或者 bind mount 该文件到其他路径。`ip netns add` 命令底层就是把 Network namespace 文件 bind mount 到 `/run/netns/` 下。
-
-## 内核实现
-
-namespace 的实现围绕一个核心结构：`nsproxy`。前面五种 namespace 各有各的隔离对象，但内核用同一套框架来管理它们。
-
-每个进程的 `task_struct` 有一个指针指向 `nsproxy`，`nsproxy` 聚合了该进程所属的各种 namespace：
+大多数 namespace 指针集中在 `struct nsproxy` 中。当前 Linux 源码的核心字段如下：
 
 ```c
-// include/linux/nsproxy.h
+/* include/linux/nsproxy.h */
 struct nsproxy {
-    refcount_t              count;
-    struct uts_namespace   *uts_ns;
-    struct ipc_namespace   *ipc_ns;
-    struct mnt_namespace   *mnt_ns;
-    struct pid_namespace   *pid_ns_for_children;
-    struct net             *net_ns;
-    struct time_namespace  *time_ns;
-    struct time_namespace  *time_ns_for_children;
+    refcount_t count;
+    struct uts_namespace *uts_ns;
+    struct ipc_namespace *ipc_ns;
+    struct mnt_namespace *mnt_ns;
+    struct pid_namespace *pid_ns_for_children;
+    struct net *net_ns;
+    struct time_namespace *time_ns;
+    struct time_namespace *time_ns_for_children;
     struct cgroup_namespace *cgroup_ns;
 };
 ```
 
-注意两个特殊点：
+这里没有 `user_ns`，也没有“当前进程的 PID namespace”。User namespace 决定凭据和 capability 的解释范围，因此通过 `task_struct->cred->user_ns` 关联。进程当前的 PID namespace 由 `task_struct->thread_pid` 指向的 `struct pid` 决定；`nsproxy->pid_ns_for_children` 只记录后续子进程应进入哪一层。Time namespace 同样区分当前视图与子进程视图。
 
-**PID namespace 存的是 `pid_ns_for_children`，不是当前进程的 PID namespace。** 进程自己的 PID namespace 记录在 `struct pid` 的 `numbers[]` 数组中（PID 一节讲过），创建后不能改变。`pid_ns_for_children` 决定的是子进程会进入哪个 PID namespace。
+完整关系可以压缩成下面这张图：
 
-**User namespace 不在 `nsproxy` 里。** 它在 `task_struct->cred->user_ns`。前面讲过，UID 和 capabilities 都是 per-namespace 的，内核在做权限检查时必须知道「在哪个 User namespace 里检查」，所以 User namespace 和 credentials（UID、GID、capabilities）放在一起，而不是和其他 namespace 一起挂在 `nsproxy` 下。
-
-完整的引用关系：
-
-```
+```text
 task_struct
-├── *nsproxy ──→ struct nsproxy
-│                ├── *uts_ns              ──→ struct uts_namespace
-│                ├── *ipc_ns              ──→ struct ipc_namespace
-│                ├── *mnt_ns              ──→ struct mnt_namespace
-│                ├── *pid_ns_for_children ──→ struct pid_namespace
-│                ├── *net_ns              ──→ struct net
-│                ├── *time_ns             ──→ struct time_namespace
-│                └── *cgroup_ns           ──→ struct cgroup_namespace
-│
-├── *thread_pid ──→ struct pid
-│                   └── numbers[] ──→ PID values in each namespace layer
-│
-└── *cred ──→ struct cred
-              └── *user_ns ──→ struct user_namespace
+├── nsproxy ────────────────┬── uts_ns
+│                           ├── ipc_ns
+│                           ├── mnt_ns
+│                           ├── net_ns
+│                           ├── cgroup_ns
+│                           └── pid_ns_for_children
+├── cred ── user_ns
+└── thread_pid ── struct pid ── numbers[] ── 多层 PID 编号
 ```
 
-`fork()`/`clone()` 时，`copy_process()` 调用 `copy_namespaces()`（`kernel/nsproxy.c`）。如果没有 `CLONE_NEW*` 标志，子进程直接共享父进程的 `nsproxy`（引用计数 +1）。如果有任何 `CLONE_NEW*` 标志，`create_new_namespaces()` 分配新的 `nsproxy`，对每种 namespace 调用对应的复制函数：
+多个任务在全部 namespace 归属相同时可以共享同一个 `nsproxy`。`fork()` 或 `clone()` 没有请求新 namespace 时，内核增加现有对象的引用；只要某一类 namespace 被新建或拆分，`copy_namespaces()` 就建立新的 `nsproxy`，复用未变化的 namespace 对象，并替换发生变化的指针。每个 namespace 实例仍有自己的类型、状态和生命周期管理，不是把所有资源复制进 `nsproxy`。
 
-```c
-// kernel/nsproxy.c (simplified)
-int copy_namespaces(u64 flags, struct task_struct *tsk)
-{
-    struct nsproxy *old_ns = tsk->nsproxy;
-
-    // fast path: no CLONE_NEW* flags, share nsproxy
-    if (!(flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
-                   CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWCGROUP |
-                   CLONE_NEWTIME))) {
-        get_nsproxy(old_ns);    // refcount +1
-        return 0;
-    }
-
-    // slow path: create new nsproxy, selectively copy/create namespaces
-    new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
-    tsk->nsproxy = new_ns;
-    return 0;
-}
-```
-
-`create_new_namespaces()` 依次调用 `copy_mnt_ns()`、`copy_utsname()`、`copy_ipcs()`、`copy_pid_ns()`、`copy_net_ns()` 等。每个函数检查对应的 `CLONE_NEW*` 标志：有标志则创建新 namespace，没有则对现有 namespace 增加引用计数。
-
-:::expand ns_common
-
-每种 namespace 都内嵌一个通用结构：
-
-```c
-// include/linux/ns_common.h
-struct ns_common {
-    struct dentry *stashed;
-    const struct proc_ns_operations *ops;
-    unsigned int inum;      // inode number shown in /proc/[pid]/ns/
-    refcount_t count;
-};
-```
-
-`inum` 就是 `/proc/[pid]/ns/` 中 `type:[inode]` 里的那个 inode 编号。`ops` 提供了每种 namespace 的操作函数（install、get、put 等），让 `setns()` 和 `/proc` 文件系统能统一处理不同类型的 namespace。
-
-:::
+Linux 内核没有一个包办进程、网络、文件系统和资源配额的单一 `container` 对象。容器运行时在用户空间把一组真实的 namespace 对象、cgroup 归属、根文件系统和进程生命周期组合成“容器”；其中 namespace 负责改变可见视图，[cgroups](/process/07-cgroup)负责限制资源用量。
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| Namespace | 包裹全局系统资源，让进程看到隔离的视图 |
-| PID | 隔离 PID 编号空间，进程在内部看到 PID 1 |
-| Mount | 隔离挂载点列表，配合 pivot_root 实现文件系统隔离 |
-| Network | 隔离网络栈，通过 veth 对建立通信通道 |
-| User | 隔离 UID/GID 和 capabilities，唯一不需要 root 即可创建 |
-| UTS | 隔离主机名，最简单的 namespace 类型 |
-| `clone()` | fork 的通用形式，用 CLONE_NEW* 标志创建子进程时建立新 namespace |
-| `unshare()` | 当前进程脱离旧 namespace 进入新的 |
-| `setns()` | 加入一个已存在的 namespace |
-| nsproxy | 内核中聚合进程所属各 namespace 的结构体 |
-| pivot_root | 交换 Mount namespace 的根挂载，比 chroot 更安全 |
-| veth | 虚拟网线对，连接不同 Network namespace |
+| PID | 为进程提供分层编号与可见性边界，最内层第一个进程是 namespace init |
+| namespace init | PID namespace 中的 PID 1，负责回收孤儿并维持该层进程生命周期 |
+| procfs | 挂载时绑定 PID 视角，`ps` 通过它获得可见进程信息 |
+| Mount | 隔离挂载列表和目录层次视图，不自动复制文件内容 |
+| 挂载传播 | 控制 mount 与 umount 事件是否在相关挂载点之间同步 |
+| `pivot_root()` | 更换当前 Mount namespace 的根挂载，并允许随后卸载旧根 |
+| Network | 隔离网络设备、协议栈状态、路由、防火墙和端口空间 |
+| veth pair | 用两个虚拟以太网接口连接不同 Network namespace |
+| bridge / NAT | 分别提供二层转发和地址转换，不由 namespace 自动配置 |
+| User | 隔离 UID、GID 以及 capability 的作用范围 |
+| ID 映射 | 定义子 User namespace 与父层 UID、GID 之间的对应关系 |
+| UTS 与其余类型 | 隔离主机标识、IPC 对象、cgroup 路径视图和部分时钟偏移 |
+| Namespace API | 用 `clone()`、`unshare()`、`setns()` 创建、拆分或加入实例 |
+| `nsproxy` | 聚合任务所关联的大多数 namespace 指针 |
 
-Linux 内核里没有「容器」这个概念，没有 container 系统调用，也没有 container 数据结构。容器就是一个普通进程，同时套上了一组 namespace（隔离它能看到的资源）加 cgroup（限制它能用多少资源）。Docker「创建容器」本质上就是 fork 一个进程，让它的 `nsproxy` 指向一组新建的 namespace，配好 cgroup，仅此而已。namespace 本身也不是什么新的内核对象类型，它只是把已有的全局资源（PID 表、挂载表、网络栈……）从「系统全局唯一」变成「per-namespace 一份」。
-
----
-
-**Linux 源码入口**：
-- [`kernel/nsproxy.c`](https://elixir.bootlin.com/linux/latest/source/kernel/nsproxy.c) — `copy_namespaces()`、`create_new_namespaces()`：namespace 的创建和复制
-- [`kernel/pid_namespace.c`](https://elixir.bootlin.com/linux/latest/source/kernel/pid_namespace.c) — `create_pid_namespace()`、`zap_pid_ns_processes()`：PID namespace 的生命周期
-- [`kernel/pid.c`](https://elixir.bootlin.com/linux/latest/source/kernel/pid.c) — `alloc_pid()`：多层 PID 分配
-- [`fs/namespace.c`](https://elixir.bootlin.com/linux/latest/source/fs/namespace.c) — `copy_mnt_ns()`、`do_pivot_root()`：Mount namespace 和 pivot_root
+namespace 的本质不是复制一台机器，而是让内核在解释 PID、路径、网络对象和权限时选择进程所属的资源实例；只有把每类资源的视图边界分别建立起来，多个进程才能组成一致的隔离环境。
 
 ---
 
-<!-- 下一篇：Cgroups -->
+**Linux 源码与接口入口**：
+- [`namespaces(7)`](https://man7.org/linux/man-pages/man7/namespaces.7.html)：namespace 类型与通用接口
+- [`pid_namespaces(7)`](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)：多层 PID、namespace init 与 procfs
+- [`mount_namespaces(7)`](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html)：挂载列表与传播类型
+- [`network_namespaces(7)`](https://man7.org/linux/man-pages/man7/network_namespaces.7.html)：网络对象归属与 veth
+- [`user_namespaces(7)`](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)：capability 范围与 ID 映射
+- [`include/linux/nsproxy.h`](https://github.com/torvalds/linux/blob/master/include/linux/nsproxy.h)：`struct nsproxy`
+- [`include/linux/pid.h`](https://github.com/torvalds/linux/blob/master/include/linux/pid.h)：`struct pid` 与多层编号
+- [`kernel/nsproxy.c`](https://github.com/torvalds/linux/blob/master/kernel/nsproxy.c)：`copy_namespaces()` 与 namespace 创建路径

@@ -13,7 +13,7 @@ const today = execFileSync('date', ['+%F'], {
 }).trim()
 
 const metaPattern =
-  /(^# .+\n\n)(?:- 协作者：`[^`\n]*`\n)?- 写作时间：`[^`\n]*`\n- 当前字符：`[^`\n]*`/m
+  /(^# .+\n\n)(?:- 协作者：`[^`\n]*`\n)?- 写作时间：`([^`\n]*)`\n- 当前字符：`[^`\n]*`/m
 const headerPattern = /^# .+\n\n/
 
 function runGit(args, { allowFailure = false } = {}) {
@@ -29,18 +29,31 @@ function runGit(args, { allowFailure = false } = {}) {
   }
 }
 
-function hasWorkingTreeChanges(relativePath) {
-  const status = runGit(['status', '--porcelain', '--', relativePath], { allowFailure: true })
-  return status.length > 0
+function readHeadSource(relativePath) {
+  try {
+    return execFileSync('git', ['show', `HEAD:${relativePath}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return ''
+  }
 }
 
 function isUnstartedLesson(source) {
   return source.includes('本篇正在编写中。') && !source.includes('\n## ')
 }
 
-function getDateText(relativePath, source) {
-  if (isUnstartedLesson(source)) return '未开始'
+function stripMeta(source) {
+  return source.replace(metaPattern, '$1')
+}
 
+function extractDateText(source) {
+  return source.match(metaPattern)?.[2] ?? ''
+}
+
+function getInitialDate(relativePath) {
   const history = runGit(
     ['log', '--follow', '--format=%ad', '--date=short', '--', relativePath],
     { allowFailure: true }
@@ -49,15 +62,22 @@ function getDateText(relativePath, source) {
     .map((line) => line.trim())
     .filter(Boolean)
 
-  const created = history.at(-1) ?? today
-  const needsInitialMeta = !metaPattern.test(source)
-  const updated =
-    hasWorkingTreeChanges(relativePath) || needsInitialMeta
-      ? today
-      : history[0] ?? today
+  return history.at(-1) ?? today
+}
 
-  if (created === updated) return created
-  return `${created} 首次提交，${updated} 最近修改`
+function getDateText(relativePath, source) {
+  if (isUnstartedLesson(source)) return '未开始'
+
+  const headSource = readHeadSource(relativePath)
+  if (headSource && stripMeta(source) === stripMeta(headSource)) {
+    return extractDateText(headSource) || getInitialDate(relativePath)
+  }
+
+  const existingDate = extractDateText(source) || extractDateText(headSource)
+  const created = existingDate.match(/^\d{4}-\d{2}-\d{2}/)?.[0] ?? getInitialDate(relativePath)
+
+  if (created === today) return created
+  return `${created} 首次提交，${today} 最近修改`
 }
 
 function countCharacters(text) {

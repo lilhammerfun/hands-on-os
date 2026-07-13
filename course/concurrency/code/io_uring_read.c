@@ -1,32 +1,87 @@
-// io_uring_read.c — read a file using io_uring
-#include <stdio.h>
+#define _GNU_SOURCE
+
 #include <fcntl.h>
-#include <string.h>
 #include <liburing.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-int main() {
+int main(int argc, char **argv)
+{
     struct io_uring ring;
-    io_uring_queue_init(32, &ring, 0);   // 创建 io_uring 实例，队列深度 32
-
-    int fd = open("test.txt", O_RDONLY);
-    char buf[4096];
-    memset(buf, 0, sizeof(buf));
-
-    // 第一步：获取 SQE 并填入读操作
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_read(sqe, fd, buf, sizeof(buf), 0);
-    sqe->user_data = 42;                 // 自定义标识，在 CQE 中原样返回
-
-    // 第二步：提交
-    io_uring_submit(&ring);
-
-    // 第三步：等待并收割 CQE
     struct io_uring_cqe *cqe;
-    io_uring_wait_cqe(&ring, &cqe);      // 等待至少一个完成事件
-    if (cqe->res > 0)
-        printf("read %d bytes: %.*s\n", cqe->res, cqe->res, buf);
-    io_uring_cqe_seen(&ring, cqe);       // 标记 CQE 已消费，推进 CQ head
+    char buffer[4096];
+    int fd = -1;
+    int status = EXIT_FAILURE;
+    int ret;
 
-    close(fd);
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s FILE\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    ret = io_uring_queue_init(32, &ring, 0);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-ret));
+        return EXIT_FAILURE;
+    }
+
+    fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror("open");
+        goto out_ring;
+    }
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (sqe == NULL) {
+        fprintf(stderr, "io_uring_get_sqe: submission queue is full\n");
+        goto out_close;
+    }
+
+    io_uring_prep_read(sqe, fd, buffer, sizeof(buffer) - 1, 0);
+    io_uring_sqe_set_data64(sqe, 42);
+
+    ret = io_uring_submit(&ring);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+        goto out_close;
+    }
+    if (ret != 1) {
+        fprintf(stderr, "io_uring_submit: submitted %d requests, expected 1\n", ret);
+        goto out_close;
+    }
+
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_wait_cqe: %s\n", strerror(-ret));
+        goto out_close;
+    }
+
+    if (io_uring_cqe_get_data64(cqe) != 42) {
+        fprintf(stderr, "unexpected completion identifier\n");
+        io_uring_cqe_seen(&ring, cqe);
+        goto out_close;
+    }
+
+    ret = cqe->res;
+    io_uring_cqe_seen(&ring, cqe);
+
+    if (ret < 0) {
+        fprintf(stderr, "read: %s\n", strerror(-ret));
+        goto out_close;
+    }
+
+    buffer[ret] = '\0';
+    printf("read %d bytes: %s\n", ret, buffer);
+    status = EXIT_SUCCESS;
+
+out_close:
+    if (close(fd) < 0) {
+        perror("close");
+        status = EXIT_FAILURE;
+    }
+out_ring:
     io_uring_queue_exit(&ring);
+    return status;
 }

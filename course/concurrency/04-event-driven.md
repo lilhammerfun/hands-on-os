@@ -1,352 +1,265 @@
 # 事件驱动并发
 
-- 写作时间：`2026-03-04 首次提交，2026-03-23 最近修改`
-- 当前字符：`15330`
+- 写作时间：`2026-03-04 首次提交，2026-07-13 最近修改`
+- 当前字符：`11058`
 
-前三课的并发方案都基于多线程。线程能工作，但随着连接数增长，代价会越来越高：同步原语保护共享状态的复杂度上升，锁用不好就死锁。而且线程本身也有资源成本，连接数一多，这个成本会变成真正的瓶颈。有没有一种方案能跳过这些问题？
+[线程](/concurrency/01-thread)让多条执行流可以分别等待 I/O，[同步原语](/concurrency/02-synchronization)和[死锁](/concurrency/03-deadlock)则说明，只要这些执行流共享状态，就必须同时处理互斥、顺序与活性问题。线程仍然是必要工具，但“每项等待都配一个线程”并不是组织大量 I/O 的唯一方式。
 
-来看一个具体场景。假设你要写一个 TCP echo 服务器，同时服务大量客户端。最直接的方案是 thread-per-connection：每来一个连接就创建一个线程处理。下面的代码用到了 socket API（网络与 IPC 一章会详细讲），这里只需要知道基本模式：`socket()` 创建通信端点，`bind()` 绑定地址，`listen()` 开始监听，`accept()` 接受新连接并返回一个 fd，之后就可以用 `read()`/`write()` 在这个 fd 上收发数据。
+来看一个服务大量连接的程序。Linux 用文件描述符(fd)表示每条连接，程序需要在连接可读时接收数据，在连接可写时发送积压的数据。若为每个连接创建一个线程，多数线程会长期睡在各自的等待队列上。睡眠线程不占用 CPU，却仍需要线程栈的虚拟地址范围、内核任务结构和调度记录；连接频繁活跃时，还会增加唤醒与调度压力。这里不能把线程栈的最大范围直接等同于已经占用的物理内存，但线程数量本身仍是需要管理的资源。
 
-<<< @/concurrency/code/echo_thread.c
+另一种组织方式是让少量线程同时照看大量 fd。要建立这条路线，先用 **I/O 语义**区分“调用是否等待”与“通知表示什么”；多个 fd 可以交给 **select 与 poll**统一等待，但它们每次都要检查整组输入。Linux 的 **epoll**把关注集合保存在内核中，只把当前就绪的事件交回应用。应用再围绕这些事件构造 **事件循环**，用状态而不是阻塞的调用记录每项工作的进度。就绪通知仍要求应用另行调用 `read()` 或 `write()`，而 **io_uring**进一步提供提交与完成队列，让应用按“提交操作，稍后取得结果”的方式组织 I/O。
 
-代码很简洁，但算一笔账。`ulimit -s` 显示 Linux 默认线程栈大小是 8MB。如果有 10,000 个并发连接，就需要 10,000 个线程，仅线程栈就要 80GB 内存。再加上每个线程对应一个 `task_struct`（约 6KB）、调度器要维护的运行队列开销、以及锁竞争带来的上下文切换，这个方案在连接数上完全扩展不了。
+## I/O 语义
 
-问题不是线程做不好，而是大多数连接在大多数时间都在等数据。这正是调度一课 `pipe_read()` 展示的等待队列模式：每个 socket 也有自己的等待队列，`read()` 在接收缓冲区为空时把线程挂上去睡眠，网络数据到达后唤醒。thread-per-connection 下，10,000 个连接就是 10,000 个等待队列，每个上面挂着一个占着 8MB 栈和 `task_struct` 的睡眠线程，大部分时间什么也不做。
+I/O 语义(I/O semantics)描述 I/O 调用何时返回，以及应用收到的通知与实际数据传输处于什么关系。
 
-既然大多数线程都睡在各自 socket 的等待队列上，能不能让一个线程同时等所有 socket，哪个有数据就处理哪个？要回答这个问题，先要看清一个线程面对"数据没到"有哪些应对方式，这就是 **I/O 模型**。上一段描述的等待队列模式就是其中一种做法（即阻塞 I/O），I/O 模型一节会展开其他几种做法以及它们之间的取舍。其中真正让一个线程同时监视多个 socket 的是多路复用：**select 与 poll** 把一组 fd 交给内核逐个检查，但每次都要过一遍全部 fd。**epoll** 换了思路，让就绪的 socket 主动报告，不再逐个检查。在 epoll 之上构建 **事件循环**：一个单线程不断等待事件、分发回调、再等待，这是 Redis、Nginx、Node.js 的核心架构。但每次读写仍要系统调用，**io_uring** 用共享环形缓冲区把系统调用也省掉了。
+理解 Linux I/O 时，需要把两个容易混在一起的问题分开：
 
-## I/O 模型
+1. **调用能否立即推进**：不能推进时，调用者是睡眠等待，还是立即得到“稍后重试”的结果？
+2. **通知代表哪个阶段**：它只表示某项操作现在可能不会阻塞，还是表示已经提交的操作完成了？
 
-I/O 模型(I/O model)描述的是应用程序面对"数据还没到"时的不同应对方式，核心区别在于：线程怎么处理这段等待。
+第一个问题区分阻塞与非阻塞。以管道或连接上的 `read()` 为例，阻塞 fd 暂时没有数据时，内核会把调用线程移入等待队列；数据到达、文件结束、信号中断或错误发生后，线程才有机会继续。这里阻塞的是调用线程，不是整个进程，其他可运行线程仍可使用 CPU。
 
-最基础的是阻塞 I/O(blocking I/O)。开篇已经展示了这个过程：线程调用 `read()` 时如果数据还没到，内核把线程挂到 socket 的等待队列上睡眠，数据到达后唤醒线程并把数据复制到用户缓冲区。睡眠期间线程释放了 CPU，其他线程可以正常运行，所以阻塞 I/O 并不浪费 CPU。如果一个线程只负责一个连接，睡眠等待是完全合理的——数据没到，线程也没别的事可做。但如果一个线程想同时照看多个连接呢？它阻塞在连接 A 的 `read()` 上睡着了，连接 B 的数据到了却无法处理——因为唤醒它的条件是连接 A 的数据到达，不是连接 B 的。
+把 fd 设置为 `O_NONBLOCK` 后，同一次 `read()` 在暂时无法取得数据时不再睡眠，而是返回 `-1`，并由 C 库包装层把 `errno` 设为 `EAGAIN` 或 `EWOULDBLOCK`。非阻塞只改变一次 I/O 调用的等待行为，并不会自动通知程序何时应该重试。如果应用不断循环调用 `read()`，仍会形成忙轮询并消耗 CPU。
 
 ```c
-while (1) {
-    read(fd_A, buf, sizeof(buf));  // 线程睡在 A 的等待队列上
-    handle(buf);                   // 即使此时连接 B 的数据已经可读，线程也醒不过来
+ssize_t n = read(fd, buf, sizeof(buf));
 
-    read(fd_B, buf, sizeof(buf));  // 必须等 A 的数据到达并处理完，才轮得到 B
-    handle(buf);
+if (n > 0) {
+    consume(buf, (size_t)n);
+} else if (n == 0) {
+    /* EOF; for a connection, the peer closed its sending side. */
+} else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    /* No progress now; retry after another readiness notification. */
 }
 ```
 
-非阻塞 I/O(non-blocking I/O)的思路是让 `read()` 立即返回。通过 `fcntl()` 给 fd 设置 `O_NONBLOCK` 标志后，`read()` 在数据未就绪时不再把线程挂到等待队列上，而是立即返回 `-1` 并设置 `errno = EAGAIN`，表示"现在没数据，稍后再试"。这样线程就可以依次检查每个连接，不会因为某一个连接没数据就睡过去。
+第二个问题区分就绪(readiness)与完成(completion)。就绪通知表示：内核观察 fd 时，所关心的操作具备立即推进的条件。例如“可读”可能表示缓冲区有数据，也可能表示已经到达文件结束或错误状态；“可写”通常表示至少有一定发送空间，不表示任意长度的数据都能一次写完。
 
-```c
-int flags = fcntl(fd, F_GETFL, 0);
-fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+就绪不是数据已经复制到应用缓冲区的完成通知。应用收到可读事件后仍要调用 `read()`，收到可写事件后仍要调用 `write()`。事件从内核产生到处理函数真正运行之间，状态还可能被其他线程改变；Linux 也可能产生偶发的就绪误报。因此，事件驱动程序通常把被监视的 fd 设置为非阻塞：即使通知已经过时，实际 I/O 也只会返回 `EAGAIN`，不会卡住负责处理所有 fd 的线程。
 
-while (1) {
-    ssize_t n = read(fd, buf, sizeof(buf));
-    if (n > 0) {
-        // 处理数据
-    } else if (n == -1 && errno == EAGAIN) {
-        // 没有数据，继续轮询
-    }
-}
-```
+完成通知表示应用先描述一项具体操作，包括 fd、缓冲区和长度，系统稍后返回这项操作的结果。结果可能是传输字节数、文件结束或错误。由于内核可能在提交调用返回后继续访问缓冲区，应用必须保证缓冲区及其关联状态一直有效，直到收到完成通知。
 
-线程确实能同时照看多个连接了，但新的问题也很明显：你必须不停地轮询(polling)。如果大部分时间数据都没到，循环的绝大部分迭代都在做无用功，白白消耗 CPU。
+阻塞、非阻塞与就绪、完成不是四个平级选项，而是两条维度。一个就绪等待接口本身可以阻塞，应用却仍把被监视的 fd 设成非阻塞；这并不矛盾，因为前者同时等待多个 fd，后者保证处理某个 fd 时不会意外睡眠。
 
-既然非阻塞 I/O 在所有连接都没有数据可读时仍然 CPU 空转，那多路复用的思路就简单了：在所有连接都没有数据时，挂起线程让它进入睡眠。这有点像回到了阻塞 I/O 的做法，但关键的不同在于：阻塞 I/O 在等某一个具体连接的数据到达，一个连接没数据就导致其他已有数据的连接无法被及时处理；而 I/O 多路复用(I/O multiplexing)只要任何一个连接有数据到达就会唤醒线程，既解决了阻塞 I/O 一次只能等一个连接的局限，又避免了非阻塞 I/O 的 CPU 空转。
-
-```c
-// 非阻塞 I/O：线程自己挨个问
-while (1) {
-    for (int i = 0; i < nfds; i++) {
-        read(fds[i], buf, sizeof(buf));  // 大部分返回 EAGAIN
-    }
-}
-
-// I/O 多路复用：让内核告诉你谁有数据
-while (1) {
-    int n = select(nfds, &readfds, ...);  // 阻塞，直到至少一个 fd 就绪
-    for (/* 只遍历就绪的 fd */) {
-        read(fd, buf, sizeof(buf));       // 读到的一定是有数据的
-    }
-}
-```
-
-异步 I/O(asynchronous I/O)走得更远。应用程序提交一个 I/O 请求后立即返回，内核在后台完成整个操作（包括数据复制），完成后通知应用程序。与多路复用不同，异步 I/O 连"内核把数据从内核缓冲区复制到用户缓冲区"这一步都不需要应用程序参与。用人话说就是：多路复用是"内核告诉你谁有数据，你自己调 `read()` 去读"，异步 I/O 是"内核替你读好了再告诉你"。这意味着多路复用下，线程每次处理就绪的连接仍然要通过 `read()` 系统调用陷入内核；连接数多、事件密集时，这些系统调用的开销会累积。异步 I/O 把读写也交给了内核，应用程序和内核之间的交互次数大幅减少。
-
-四种模型的对比：
-
-| 模型 | 等待数据就绪 | 数据复制 | 线程是否阻塞 |
-|------|------------|---------|------------|
-| 阻塞 I/O | 阻塞 | 阻塞 | 是，全程阻塞 |
-| 非阻塞 I/O | 不阻塞（轮询） | 阻塞 | 否，但 CPU 空转 |
-| I/O 多路复用 | 阻塞在 select/poll/epoll | 阻塞 | 是，但一个线程等多个 fd |
-| 异步 I/O | 不阻塞 | 不阻塞 | 否，内核完成全部工作 |
-
-:::expand POSIX aio
-
-POSIX 标准定义了一套异步 I/O 接口：`aio_read()`、`aio_write()`、`aio_error()`、`aio_return()` 等。glibc 的实现（`glibc/rt/aio_misc.c`）并不是真正的内核级异步 I/O，而是在用户态用线程池模拟的。具体过程是：调用者提交一个 `aio_read()` 后，glibc 从内部线程池取出一个工作线程，让这个工作线程去执行普通的阻塞 `read()`。工作线程阻塞在等待队列上睡眠，数据到达后被唤醒、完成数据复制，然后通过信号（`SIGEV_SIGNAL`）或回调函数（`SIGEV_THREAD`）通知调用者"数据读好了"。
-
-从调用者的视角看，`aio_read()` 提交后立即返回，数据到了会收到通知，确实像异步 I/O。但从系统整体看，阻塞并没有消失，只是从调用者的线程转移到了线程池里的工作线程。每次 I/O 仍然是一次 `read()` 系统调用、一次线程阻塞和唤醒，系统调用次数和上下文切换一个都没减少。Linux 的 io_uring 才是真正的内核级异步 I/O，后面会详细讨论。
-:::
+| 机制 | 应用提交的内容 | 返回或通知的含义 | 后续动作 |
+|------|----------------|------------------|----------|
+| 阻塞 `read()` | 一次读取操作 | 读取有结果后返回，期间线程可能睡眠 | 直接处理返回值 |
+| 非阻塞 `read()` | 一次读取操作 | 不能立即推进时返回 `EAGAIN` | 稍后重试 |
+| 就绪通知 | 关心的 fd 与事件类型 | 某类 I/O 当前可能不会阻塞 | 应用再调用 `read()` 或 `write()` |
+| 完成通知 | 一项带缓冲区的具体 I/O | 已提交操作已经得到结果 | 读取完成结果并管理下一项操作 |
 
 ## select 与 poll
 
-select 和 poll 是 Unix/Linux 最早提供的 I/O 多路复用系统调用，允许一个线程同时等待多个 fd 上的事件。
+select 与 poll 是让一个线程同时等待一组文件描述符就绪的同步 I/O 多路复用(I/O multiplexing)接口。
 
-先看 `select()` 的接口：
+“同步”在这里表示接口返回的是就绪状态，实际 I/O 仍由应用随后执行。调用线程可以在 `select()` 或 `poll()` 中睡眠；只要任意被关注的 fd 就绪、超时到期或信号中断等待，调用就会返回。
+
+`select()` 的接口把可读、可写和异常条件分成三组 `fd_set`：
 
 ```c
-int select(int nfds, fd_set *readfds, fd_set *writefds,
-           fd_set *exceptfds, struct timeval *timeout);
+int select(int nfds,
+           fd_set *readfds,
+           fd_set *writefds,
+           fd_set *exceptfds,
+           struct timeval *timeout);
 ```
 
-`fd_set` 是一个位图(bitmap)，每一位对应一个 fd。调用前，用 `FD_SET()` 把要监视的 fd 对应的位设为 1；调用后，内核把没有事件的 fd 对应的位清零，只留下就绪的 fd。`nfds` 是所有被监视 fd 中最大值加 1，内核用它来确定需要扫描的范围。
+`fd_set` 是一组 fd 的位集合。调用前，应用用 `FD_SET()` 指明关心哪些 fd；调用后，集合被原地改写，只保留当前就绪的 fd。`nfds` 不是集合大小，也不是 fd 数量，而是三组集合中最大 fd 加一。因为输入集合被覆盖，循环中的每次调用都必须从保存的关注集合重新复制一份。
 
-用 select 重写 echo server：
+```c
+fd_set ready = interest;
+int count = select(max_fd + 1, &ready, NULL, NULL, NULL);
 
-<<< @/concurrency/code/echo_select.c
+if (count > 0) {
+    for (int fd = 0; fd <= max_fd; fd++) {
+        if (FD_ISSET(fd, &ready)) {
+            handle_readiness(fd);
+        }
+    }
+}
+```
 
-整个服务器只有一个线程，用 `select()` 同时等待所有连接。没有线程创建、没有栈内存开销、没有锁。但 select 有三个明显的限制：
+在 glibc 中，`fd_set` 是固定大小的类型，`FD_SETSIZE` 为 1024。把负数或不小于 `FD_SETSIZE` 的 fd 交给 `FD_SET()` 等宏属于未定义行为。这个限制来自用户态接口的数据结构，不是“重新编译内核头文件”就能可靠消除的；现代程序需要监视更大 fd 时应改用不依赖固定 fd 位图的接口。
 
-1. **`FD_SETSIZE` 上限**。`fd_set` 是一个固定大小的位图，`FD_SETSIZE` 默认是 1024。这意味着 select 最多只能监视 1024 个 fd。这个限制是编译期决定的，要改只能重新编译内核头文件。
+`poll()` 把每个 fd、关注事件和返回事件放在同一个数组元素中：
 
-2. **每次调用都要重建 `fd_set`**。select 返回时会修改传入的 `fd_set`（把未就绪的 fd 清零），所以每次调用前都必须把所有要监视的 fd 重新设置一遍。上面代码中 `read_fds = all_fds` 这行就是在做这件事。
+```c
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
 
-3. **O(n) 线性扫描**。select 返回后只告诉你"有 fd 就绪了"，但不告诉你是哪些。你必须用 `FD_ISSET()` 逐个检查每个 fd。内核实现也是线性扫描：`fs/select.c` 中的 `do_select()` 遍历所有被监视的 fd，逐个调用它们的 `poll()` 方法检查是否有事件。
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+```
 
-:::thinking 为什么 select 要求调用者每次重新设置 fd_set？
+`events` 是应用写入的关注条件，`revents` 是内核写回的实际条件，因此返回后不必重建整个关注集合。数组长度在运行时决定，也没有 `FD_SETSIZE` 这一固定上限；程序仍受进程可打开 fd 数量、可用内存和其他系统资源限制。`POLLERR`、`POLLHUP` 与 `POLLNVAL` 等结果即使没有写进 `events`，也可能出现在 `revents` 中，所以处理循环不能只检查 `POLLIN`。
 
-`fd_set` 既是输入参数（告诉内核"我关心哪些 fd"），又是输出参数（内核告诉你"哪些 fd 就绪了"）。内核在 `do_select()` 中用同一个 `fd_set` 来写结果：把没有事件的 fd 对应的位清零，只留下就绪的。这意味着调用结束后，原来的"关心列表"已经被覆盖了。
+两者共同的扩展性限制来自“每次调用都重新提交整个关注集合”。Linux 内核需要逐项查询这些 fd 的当前状态，用户态返回后也需要扫描位集合或 `pollfd` 数组，找出具体哪些项就绪。若监视 10,000 个 fd 而只有 5 个活跃，检查成本仍主要由 10,000 个关注项决定。
 
-一种替代设计是用两组 `fd_set`：一组输入、一组输出，内核不修改输入。但 select 的接口设计于 1983 年的 4.2BSD，那个时代内存紧张，多一份 `fd_set` 的开销是实际考量。而且 `fd_set` 通过值传递（实际上是 `copy_from_user` 复制到内核空间），即使分成两组，内核还是要从用户空间复制一份进来。select 选择了最简单的方案：复用同一块内存，代价是调用者每次要重新初始化。
+| 特性 | `select` | `poll` |
+|------|----------|--------|
+| 关注集合 | 三个固定大小的 `fd_set` | 运行时长度的 `pollfd` 数组 |
+| 输入与输出 | 同一集合被改写 | `events` 与 `revents` 分离 |
+| fd 范围 | glibc 中小于 `FD_SETSIZE` | 没有 `FD_SETSIZE` 限制 |
+| 返回后定位事件 | 扫描到 `nfds - 1` | 扫描全部数组元素 |
+| 跨调用保存关注集合 | 否 | 否 |
 
-poll 吸取了这个教训，用 `struct pollfd` 数组把"关心的事件"（`events` 字段）和"就绪的事件"（`revents` 字段）分开存储，内核只写 `revents`，不动 `events`，调用者不需要每次重建。
-:::
-
-`poll()` 改进了 select 的前两个限制。它用 `struct pollfd` 数组代替位图，没有 `FD_SETSIZE` 的限制；输入（`events`）和输出（`revents`）分离，不需要每次重建。但第三个问题没变：内核仍然要遍历整个数组，用户态也要遍历找出就绪的 fd。
-
-| 特性 | select | poll |
-|------|--------|------|
-| fd 数量上限 | `FD_SETSIZE`（默认 1024） | 无上限（动态数组） |
-| 每次调用是否需要重建 | 是（`fd_set` 被内核修改） | 否（`events` 和 `revents` 分离） |
-| 内核扫描复杂度 | O(n) | O(n) |
-| 用户态检查复杂度 | O(n) | O(n) |
-
-当 fd 数量少（几十到几百个）时，select 和 poll 工作得很好，线性扫描的开销可以忽略。但当 fd 数量达到数千甚至数万时，每次系统调用都要遍历所有 fd，其中大部分可能根本没有事件，这个 O(n) 开销就变得不可接受了。
+`select` 与 `poll` 并非在所有场景都慢。关注项较少、集合经常变化或程序需要可移植接口时，线性扫描可能足够简单有效。问题只在大量 fd 长期注册、每次仅少数就绪时变得突出，下一种 Linux 接口正是通过改变数据组织方式处理这个场景。
 
 ## epoll
 
-epoll 是 Linux 特有的 I/O 多路复用机制，通过在内核中维护一棵红黑树(red-black tree)存储被监视的 fd、一条就绪链表(ready list)收集有事件的 fd，实现了 O(1) 的事件通知。
+epoll 是 Linux 提供的有状态就绪通知接口，它在内核中保存关注集合，并通过就绪列表向应用返回发生事件的项目。
 
-与 select/poll 的根本区别在于：select 和 poll 是无状态的，每次调用都要重新告诉内核"我关心哪些 fd"；epoll 是有状态的，通过 `epoll_ctl()` 提前注册 fd，内核记住了你的"关心列表"，之后每次 `epoll_wait()` 只需要检查就绪链表，不需要重新扫描。
-
-epoll 的 API 只有三个函数：
+epoll 实例包含两个逻辑集合：关注列表(interest list)记录应用希望监视的 fd 与事件类型，就绪列表(ready list)记录当前有事件可交付的关注项。三个主要接口分别管理这两个集合：
 
 ```c
-// 创建 epoll 实例，返回一个 epoll fd
 int epoll_create1(int flags);
-
-// 注册/修改/删除被监视的 fd
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
-
-// 等待事件，返回就绪的 fd 数量
 int epoll_wait(int epfd, struct epoll_event *events,
                int maxevents, int timeout);
 ```
 
-`epoll_create1()` 在内核中创建一个 `eventpoll` 结构体。来看这个结构体的核心字段：
+`epoll_create1()` 创建实例并返回 epoll fd。应用用 `epoll_ctl()` 的 `EPOLL_CTL_ADD`、`EPOLL_CTL_MOD` 和 `EPOLL_CTL_DEL` 操作关注列表，再用 `epoll_wait()` 取得不超过 `maxevents` 个就绪事件。没有事件时，调用线程可以睡在 epoll 实例的等待队列上。
+
+普通磁盘文件通常会被 `select()` 和 `poll()` 视为立即可读写，因为这两个接口无法为普通文件建立有意义的就绪等待；`epoll_ctl()` 注册普通文件时通常会返回 `EPERM`，不能把它也归入“始终就绪”。就绪多路复用主要用于管道、终端、套接字等具有等待语义的 fd。后文使用网络连接作为主要场景，但同样的机制也适用于这些其他 fd 类型。
+
+注册 fd 时，epoll 会接入该文件对象的等待机制。底层状态变化触发回调后，相应关注项会进入就绪列表，并唤醒等待者。当前 Linux 实现使用树结构查找关注项，并用链表组织可交付事件；这些是实现手段，不是 epoll 的接口语义。应用真正依赖的是“关注集合跨调用保留”和“等待时不必重新扫描所有未活跃 fd”。
+
+因此，把 epoll 简写为“所有操作都是 O(1)”并不准确。`epoll_ctl()` 要查找或修改关注项，事件产生时要执行回调和入队，`epoll_wait()` 还要把最多 `maxevents` 个结果复制到用户空间。epoll 的关键收益是避免每次等待都重新提交并检查全部不活跃 fd，实际成本仍取决于注册变化、就绪事件数、唤醒和并发访问。
+
+epoll 有两种主要触发方式。水平触发(level-triggered, LT)是默认模式：只要所关心的条件仍成立，后续 `epoll_wait()` 仍可再次报告该 fd。边缘触发(edge-triggered, ET)关注状态变化；一次事件到达后，如果应用没有把当前可处理的数据消耗完，不能依赖下一次等待再次报告同一批数据。
+
+ET 模式通常与非阻塞 fd 配合，并持续处理到操作返回 `EAGAIN`：
 
 ```c
-// fs/eventpoll.c (simplified)
-struct eventpoll {
-    struct rb_root_cached rbr;    // 红黑树根，存储所有被监视的 fd
-    struct list_head     rdllist; // 就绪链表，存储有事件的 fd
-    wait_queue_head_t    wq;      // 等待队列，epoll_wait() 的调用者在这里睡眠
-    // ...
-};
-```
-
-红黑树 `rbr` 存储了通过 `epoll_ctl()` 注册的所有 fd，树中每个节点是一个 `epitem` 结构体，代表一个被监视的 fd：
-
-```c
-// fs/eventpoll.c (simplified)
-struct epitem {
-    struct rb_node       rbn;     // 红黑树节点，挂在 eventpoll.rbr 上
-    struct list_head     rdllink; // 就绪链表节点，挂在 eventpoll.rdllist 上
-    struct epoll_filefd  ffd;     // 被监视的 fd
-    struct epoll_event   event;   // 用户注册的事件掩码（EPOLLIN / EPOLLOUT / EPOLLET 等）
-    struct eventpoll     *ep;     // 指回所属的 eventpoll 实例
-    // ...
-};
-```
-
-`epoll_ctl(EPOLL_CTL_ADD)` 在红黑树中插入一个 `epitem`，`EPOLL_CTL_DEL` 从树中删除，`EPOLL_CTL_MOD` 修改 `epitem` 中的事件掩码。`epoll_wait()` 检查就绪链表 `rdllist`：如果链表非空，直接返回就绪事件；如果为空，调用者在 `wq` 上睡眠等待。
-
-内核实现的关键在 `fs/eventpoll.c`。当 `epoll_ctl(EPOLL_CTL_ADD)` 注册一个 fd 时，`ep_insert()` 除了在红黑树中插入 `epitem`，还给这个 fd 注册一个回调函数(callback) `ep_poll_callback`。之后当这个 fd 上有数据到达时（比如网卡收到数据包，协议栈处理完毕），内核会调用这个回调函数，回调函数把对应的 `epitem` 通过 `rdllink` 加入就绪链表 `rdllist`，然后唤醒 `wq` 上睡眠的线程。`epoll_wait()` 的实现（`ep_poll()`）被唤醒后，从 `rdllist` 中取出就绪的 `epitem`，把它们的事件信息复制到用户空间返回。
-
-epoll 支持两种触发模式。水平触发(Level-Triggered, LT)是默认模式：只要 fd 上有未读数据，`epoll_wait()` 每次调用都会报告这个 fd。边缘触发(Edge-Triggered, ET)只在 fd 状态发生变化时报告一次：数据从无到有时通知一次，之后不再通知，直到下一次新数据到达。
-
-下面是本课的旗舰代码：一个基于 epoll ET 模式 + 非阻塞 I/O 的 echo server。
-
-<<< @/concurrency/code/echo_epoll.c
-
-:::thinking ET 模式为什么必须搭配非阻塞 I/O？
-
-ET 模式只在 fd 状态变化时通知一次。假设 socket 上到了 8KB 数据，`epoll_wait()` 返回这个 fd 就绪，你调用 `read(fd, buf, 4096)` 读了 4KB。此时 fd 上还剩 4KB 未读数据，但 ET 模式不会再次通知你（因为状态没有"变化"，数据一直都有），这 4KB 就会一直留在缓冲区里，直到对端再发数据触发新的通知。
-
-所以 ET 模式要求每次通知时必须用循环把数据读完：
-
-```c
-while (1) {
+for (;;) {
     ssize_t n = read(fd, buf, sizeof(buf));
-    if (n == -1 && errno == EAGAIN) break;  // 读完了
-    // 处理数据
+
+    if (n > 0) {
+        consume(buf, (size_t)n);
+        continue;
+    }
+    if (n == 0) {
+        close_connection(fd);
+        break;
+    }
+    if (errno == EINTR) {
+        continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+    }
+    handle_read_error(fd, errno);
+    break;
 }
 ```
 
-但如果 fd 是阻塞的，当数据读完后，最后一次 `read()` 会阻塞（因为没有数据了），整个事件循环就卡住了。设置 `O_NONBLOCK` 后，`read()` 在没有数据时返回 `EAGAIN` 而不是阻塞，循环可以安全退出，事件循环继续处理其他 fd。
+这里的 `EAGAIN` 不是失败，而是“这一轮已经处理到当前边界”。如果 fd 仍为阻塞模式，循环在读完现有数据后可能睡在最后一次 `read()` 上，其他所有 fd 都无法被分发。监听 fd 上的 `accept()` 也要循环到 `EAGAIN`，写操作则必须处理短写(short write)，也就是 `write()` 成功但只接收部分数据的情况，并保存尚未发送的部分。
 
-所以 ET + 非阻塞 I/O 是一个配套组合：ET 要求读完所有数据，非阻塞保证"读完"这个循环能终止。
-:::
+LT 模式更容易写对，但也不能把一次通知等同于一次完整消息。流式连接只提供字节序列，一次 `read()` 可能取得半条、恰好一条或多条应用消息；消息边界必须由上层协议自行恢复。ET 与 LT 改变的是事件何时再次交付，不改变字节流语义。
 
-与 select 版本对比：没有 `FD_SETSIZE` 限制，没有每次重建 fd_set 的开销，`epoll_wait()` 只返回就绪的 fd。10,000 个连接中如果只有 5 个有数据，select 要遍历 10,000 个 fd，epoll 只返回 5 个事件。
-
-:::thinking 为什么 epoll 比 select 快？
-
-这个问题需要追到内核实现才能看清楚。
-
-select 的核心是 `fs/select.c` 中的 `do_select()`。每次调用 `select()` 时，`do_select()` 做三件事：第一，从用户空间复制 `fd_set` 到内核空间（`copy_from_user`）；第二，遍历 `[0, nfds)` 范围内的所有 fd，对每个 fd 调用它的 `poll()` 方法检查是否有事件；第三，把结果写回用户空间的 `fd_set`。如果没有任何 fd 就绪，`do_select()` 让线程睡眠，被唤醒后再次遍历所有 fd。整个过程是 O(n) 的，而且每次系统调用都要重新来一遍。
-
-epoll 的核心是 `fs/eventpoll.c` 中的 `ep_poll()` 和 `ep_insert()`。注册 fd 时（`epoll_ctl`），`ep_insert()` 把 fd 加入红黑树，并注册回调 `ep_poll_callback`。之后当 fd 有事件时，回调函数直接把这个 fd 的 `epitem` 加入就绪链表。`epoll_wait()` 调用 `ep_poll()`，它只需要检查就绪链表 `rdllist` 是否为空。非空就把链表中的事件复制到用户空间，为空就睡眠。
-
-关键差异在于：select 每次调用都主动遍历所有 fd 去检查状态，是"拉"模型；epoll 让内核在事件发生时通过回调主动通知，是"推"模型。select 的开销与被监视的 fd 总数成正比，epoll 的开销与就绪的 fd 数量成正比。当 10,000 个 fd 中只有 10 个就绪时，select 做了 10,000 次检查，epoll 只返回 10 个事件。
-:::
-
-:::expand C10K 问题
-
-1999 年，Dan Kegel 在他的文章 *The C10K Problem* 中提出了一个问题：如何让一台服务器同时处理 10,000 个并发连接？在当时，这是一个真实的工程挑战。
-
-thread-per-connection 模型下，10,000 个连接意味着 10,000 个线程，内存和调度开销使这个方案不可行。select 有 `FD_SETSIZE = 1024` 的硬限制。poll 去掉了这个限制，但 O(n) 的扫描开销在 10,000 个 fd 时仍然太高。
-
-Kegel 的文章系统地分析了各种 I/O 策略，其中重点推荐了基于事件通知的方案。Linux 2.5.44（2002 年）引入了 epoll，FreeBSD 引入了 kqueue，Windows 有 IOCP(I/O Completion Ports)。这些机制让单线程处理数万个并发连接成为现实，C10K 问题随之解决。今天的高性能服务器（Nginx、Redis、Node.js）都基于这类事件驱动架构，能够轻松处理数十万甚至百万级并发连接。
-:::
+无论哪种模式，就绪事件都只是重新尝试 I/O 的依据。fd 可能在事件入队后被其他执行流处理，错误或挂断也可能与可读、可写标志同时出现。程序还要规定 fd 所有权，也就是哪条执行流负责读写、修改关注项和关闭该 fd。非阻塞 I/O、完整的返回值检查和明确的所有权规则，才能保证负责处理整组 fd 的线程不被单个连接卡住。
 
 ## 事件循环
 
-事件循环(event loop)是一种编程模式：单个线程在循环中调用 `epoll_wait()`（或类似的多路复用 API）等待事件，收到事件后分发给对应的回调函数处理，处理完毕后返回继续等待。
+事件循环(event loop)是反复等待一批事件、把事件分派给处理逻辑并记录下一步状态的控制流程。
 
-事件循环的骨架代码：
+最小结构可以写成下面的 C 控制流骨架：
 
 ```c
-while (running) {
-    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);  // 阻塞等待事件
+for (;;) {
+    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+
     for (int i = 0; i < n; i++) {
-        handler_t handler = lookup(events[i].data.fd);  // 找到该 fd 注册的回调
-        handler(&events[i]);                             // 执行回调
+        dispatch(events[i]);
     }
 }
 ```
 
-这个模式有一条核心约束：**回调必须非阻塞**。事件循环是单线程的，如果一个回调执行了阻塞操作（比如读数据库、请求外部 API），整个循环就停在这里，所有其他 fd 的事件都得不到处理。在 thread-per-connection 模型中，一个线程阻塞只影响一个连接；在事件循环中，一个回调阻塞影响所有连接。
+真正的事件循环并不只是这个双层循环。每条连接都需要一份状态，记录当前处于读取头部、读取正文、处理请求还是发送响应，以及缓冲区中已有多少字节。状态机(state machine)就是有限状态及其转换规则的集合；一次事件只推进当前能够完成的步骤，遇到 `EAGAIN` 后保存状态并返回，下一次事件从保存位置继续。
 
-这引出了事件驱动与多线程模型的本质区别。多线程是抢占式并发(preemptive concurrency)：操作系统调度器决定何时切换线程，线程可以在任意时刻被中断。事件循环是协作式并发(cooperative concurrency)：每个回调主动让出控制权（通过返回），循环才能继续处理下一个事件。抢占式并发需要锁来保护共享状态，协作式并发天然不需要锁，因为同一时刻只有一个回调在执行。但协作的前提是每个参与者都遵守"不阻塞"的约定。
+这种组织方式提供并发，但单个事件循环线程并不自动提供并行。多个连接的工作在时间上交错推进，同一时刻仍只有一个处理函数占用该线程。若某个处理函数执行阻塞 I/O、长时间计算或无界循环，其他已经就绪的连接也只能等待。因此，处理函数应当完成有限工作后尽快归还控制权。
 
-```mermaid
-sequenceDiagram
-    participant EL as 事件循环
-    participant EP as epoll
-    participant H1 as 回调 A
-    participant H2 as 回调 B
+CPU 密集工作可以交给工作线程池，也可以让多个事件循环分别拥有一组连接，从而利用多个 CPU。此时又会重新出现跨线程通信：任务队列、完成通知和共享缓存都可能需要原子操作或锁。事件循环并非“天然无锁”；只有明确归某一个循环线程独占的状态，才可以在该所有权范围内避免锁。
 
-    EL->>EP: epoll_wait()
-    Note over EL,EP: 阻塞，等待事件
-    EP-->>EL: fd=5 可读, fd=8 可读
-    EL->>H1: 处理 fd=5
-    H1-->>EL: 返回
-    EL->>H2: 处理 fd=8
-    H2-->>EL: 返回
-    EL->>EP: epoll_wait()
-    Note over EL,EP: 继续等待下一批事件
-```
+事件循环还必须处理背压(backpressure)。背压是下游处理速度低于上游产生速度时，系统主动限制继续接收工作的机制。假设应用读取请求很快，但对端接收响应很慢，未发送数据就会不断堆积。正确做法是把待发送量限制在明确范围内，只在确实有积压时关注可写事件；达到高水位后暂停读取或拒绝新工作，降到低水位后再恢复。高水位和低水位分别是触发暂停与恢复的队列阈值。
 
-:::expand Reactor 与 Proactor 模式
+可写事件尤其容易造成忙循环。连接的发送缓冲区通常大部分时间都有空间，如果始终关注 `EPOLLOUT`，`epoll_wait()` 可能持续返回同一个 fd。应用应在待发送队列从空变为非空时启用可写关注，数据全部发送后关闭该关注。
 
-事件循环的设计模式在软件工程中有两个经典变体。
-
-**Reactor 模式**：事件循环等待 fd 就绪（可读/可写），然后通知应用程序去执行实际的 I/O 操作（`read()`/`write()`）。epoll 就是 Reactor 模式的基础：`epoll_wait()` 通知你"fd 可读了"，你自己调用 `read()` 读数据。Redis、Nginx、libevent、libev 都是 Reactor 模式。
-
-**Proactor 模式**：应用程序提前提交 I/O 操作（"我要读这个 fd 的数据到这块缓冲区"），内核/框架在后台完成整个 I/O 操作，完成后通知应用程序"数据已经读好了，在你指定的缓冲区里"。Windows 的 IOCP 是 Proactor 模式的典型实现，Linux 的 io_uring 也支持 Proactor 语义。
-
-两者的区别在于"谁执行 I/O"。Reactor 是"通知你就绪了，你自己读"，Proactor 是"你告诉我读哪里，我读好了通知你"。Proactor 减少了应用程序的参与度，但实现更复杂，需要操作系统提供真正的异步 I/O 支持。
-:::
+公平性也需要显式设计。某个持续可读的 fd 若每次都处理到无限量数据，可能让其他连接饥饿；可以为一次分派设置字节数、消息数或时间预算，到达预算后把控制权交回循环。事件驱动减少的是等待所需的线程数量，不会替应用自动解决状态管理、背压与公平。
 
 ## io_uring
 
-io_uring 是 Linux 5.1（2019 年）引入的异步 I/O 框架，通过内核与用户空间共享的提交队列(Submission Queue, SQ)和完成队列(Completion Queue, CQ)两个环形缓冲区(ring buffer)，实现了无需系统调用的异步 I/O 提交与收割。
+io_uring 是 Linux 的完成式异步 I/O 接口，它通过用户空间与内核共享的提交队列(Submission Queue, SQ)和完成队列(Completion Queue, CQ)传递请求与结果。
 
-为什么还需要 io_uring？epoll 已经解决了"高效等待多个 fd"的问题，但它只负责通知"fd 就绪了"，实际的读写操作仍然需要 `read()`/`write()` 系统调用。一次典型的网络 I/O 需要两个系统调用：`epoll_wait()` 等待就绪，`read()` 读取数据。每次系统调用都要从用户态陷入内核态，保存/恢复寄存器，还要经过 Spectre/Meltdown 缓解措施带来的额外开销。在高吞吐场景下，系统调用本身的开销成为瓶颈。
+epoll 的流程是“等待 fd 就绪，再调用 I/O 接口”；io_uring 的流程是“先提交一项具体操作，再取得该操作的完成结果”。两者都可以驱动事件循环，但事件对象不同：epoll 事件关联某个 fd 的当前状态，io_uring 完成项关联此前提交的某个请求。
 
-io_uring 的核心思想是：把系统调用变成内存写入。应用程序把 I/O 请求写入 SQ（一块与内核共享的内存），内核完成后把结果写入 CQ（同样是共享内存），应用程序从 CQ 读取结果。整个过程可以不需要任何系统调用。
+创建 io_uring 实例后，应用把共享队列映射到自己的地址空间。SQ 和 CQ 都使用环形缓冲区(ring buffer)：头、尾索引到达固定容量存储区的末端后会回绕到开头，因此也常称环形队列。每个提交队列项(Submission Queue Entry, SQE)描述一项操作，例如从某个 fd 读取到指定缓冲区；每个完成队列项(Completion Queue Entry, CQE)返回对应操作的结果。简化后的数据流如下：
 
-```
-用户空间                              内核空间
-┌──────────────┐                   ┌──────────────┐
-│  Submission  │ ── 共享内存 ──→   │   内核读取    │
-│  Queue (SQ)  │   应用写入 SQE    │   SQE 并执行  │
-└──────────────┘                   └──────────────┘
-
-┌──────────────┐                   ┌──────────────┐
-│  Completion  │ ←── 共享内存 ──   │   内核写入    │
-│  Queue (CQ)  │   应用读取 CQE    │   完成的 CQE  │
-└──────────────┘                   └──────────────┘
+```text
+应用填写 SQE
+      |
+      v
+发布到 SQ -> 内核取得请求 -> 执行或安排 I/O
+                                  |
+                                  v
+应用读取 CQE <- 发布到 CQ <- 生成完成结果
 ```
 
-使用流程分四步：第一，从 SQ 获取一个空闲的提交队列条目(Submission Queue Entry, SQE)；第二，在 SQE 中填入操作类型和参数（如"读取 fd=5 到 buf，长度 4096"）；第三，提交（更新 SQ 的 tail 指针，让内核看到新的 SQE）；第四，从 CQ 收割完成队列条目(Completion Queue Entry, CQE)，获取操作结果。
+SQE 的 `user_data` 字段由应用自行填写，内核会把它原样带回 CQE。不同操作的完成顺序可能与提交顺序不同，这就是乱序完成；应用通常在 `user_data` 中保存请求编号或指向请求状态的标识，以便每个 CQE 都能找到对应上下文。CQE 的 `res` 保存操作结果：读写成功时通常是传输字节数，失败时是负的错误号，例如 `-EIO`，而不是返回 `-1` 后再通过 `errno` 取错。
 
-liburing 是 Jens Axboe（io_uring 的作者）开发的用户态库，封装了底层的 mmap 和环形缓冲区操作。下面用 liburing 读取一个文件：
+```c
+struct io_uring_cqe {
+    __u64 user_data;
+    __s32 res;
+    __u32 flags;
+};
+```
 
-<<< @/concurrency/code/io_uring_read.c
+共享队列不等于没有同步。应用必须先完整写好 SQE，再以规定的内存顺序发布队列尾位置；内核也必须先完整写好 CQE，再发布完成队列尾位置。[同步原语](/concurrency/02-synchronization)讲过的 release/acquire 顺序在这里承担同样职责：消费者看到新的尾位置时，也必须能看到该位置之前写入的条目内容。实际程序通常使用 io_uring 用户态封装库 `liburing` 处理这些队列操作，避免直接管理映射布局和内存屏障。
 
-编译时需要链接 liburing：`gcc -o io_uring_read io_uring_read.c -luring`。
+普通模式下，应用填入一个或多个 SQE 后调用 `io_uring_enter()`，一次系统调用可以批量提交多项 I/O，也可以同时等待一定数量的完成项。CQ 中已经有结果时，应用可以直接读取共享内存，不必为每个完成项单独进入内核；若需要睡眠等待新的完成，仍可能调用 `io_uring_enter()`。所以 io_uring 的默认优势是批处理和共享队列，不是无条件“零系统调用”。
 
-上面的代码中，`io_uring_submit()` 仍然会发起一次 `io_uring_enter()` 系统调用来通知内核。但 io_uring 提供了 SQPOLL 模式，可以彻底消除提交阶段的系统调用。
+提交队列轮询(SQ polling, SQPOLL)模式会创建一个内核线程轮询 SQ。只要该线程保持活跃，应用发布 SQE 后可以由它直接取得请求，省去提交阶段的系统调用；线程空闲并睡眠后，内核会设置 `IORING_SQ_NEED_WAKEUP`，应用仍需调用 `io_uring_enter()` 将其唤醒。持续轮询也占用 CPU，因此 SQPOLL 是否有收益取决于负载，不能作为所有程序的默认选择。
 
-创建 io_uring 时传入 `IORING_SETUP_SQPOLL` 标志，内核会启动一个专门的内核线程（sq_thread）不断轮询 SQ 的 tail 指针。应用程序写入 SQE 后只需要更新 tail 指针（一次普通的内存写入），内核线程发现 tail 变了就立刻取走 SQE 执行。整个提交过程没有系统调用，没有用户态到内核态的切换。
+完成式接口也不保证每项操作都由设备“原生异步”完成。内核可能在提交路径立即完成某些操作，也可能等待设备，或者把可能阻塞的工作转交异步工作线程。应用依赖的保证是稍后用 CQE 取得统一结果，而不是某一种固定的内核执行路径。
 
-:::thinking io_uring 的零系统调用是怎么做到的？
+缓冲区生命周期是完成式 I/O 最重要的正确性约束之一。提交读取后，在 CQE 到达前复用或释放目标缓冲区，会让内核写入已经改变用途的内存；提交写入后过早修改源缓冲区，也可能改变实际发送内容。关闭 fd、取消请求和处理部分完成同样需要与在途请求协调。io_uring 减少了系统调用和重复通知，但把更多生命周期管理责任交给了应用。
 
-关键在于 SQ 和 CQ 是通过 `mmap` 映射的共享内存，用户空间和内核空间看到的是同一块物理内存。
-
-普通模式下，应用程序填好 SQE 后调用 `io_uring_enter()` 系统调用通知内核"有新请求了"。内核收到后从 SQ 取出 SQE 执行。这里仍然有一次系统调用。
-
-SQPOLL 模式下，内核启动一个内核线程（实现在 `io_uring/sqpoll.c` 的 `io_sq_thread()` 函数中），这个线程在一个循环中不断检查 SQ 的 tail 指针。SQ 是环形缓冲区，有 head（内核消费位置）和 tail（应用程序生产位置）两个指针。当 `tail != head` 时，说明有新的 SQE 等待处理，内核线程取出并执行。应用程序只需要往共享内存中写入 SQE 并更新 tail 指针，这是纯用户态的内存操作，不涉及任何系统调用。
-
-收割阶段同理：内核完成 I/O 后把 CQE 写入 CQ 并更新 CQ 的 tail 指针，应用程序读取 CQE 并更新 head 指针，也是纯内存操作。
-
-这就是"零系统调用"的含义：提交和收割都变成了对共享内存中环形缓冲区指针的读写，用户态和内核态通过共享内存通信，不再需要 `syscall` 指令来切换特权级。代价是一个持续运行的内核线程会消耗 CPU，所以 SQPOLL 模式适合高吞吐场景，不适合空闲时间长的轻负载服务。
-:::
-
-:::expand Jens Axboe
-
-![Jens Axboe](https://upload.wikimedia.org/wikipedia/commons/thumb/e/e9/Jens_Axboe.jpg/330px-Jens_Axboe.jpg)
-
-Jens Axboe 是丹麦裔软件工程师，Linux 内核块层(block layer)的长期维护者。他设计并实现了多个 Linux I/O 子系统的核心组件：CFQ I/O 调度器、Deadline 调度器、splice 系统调用，以及 io_uring。io_uring 于 2019 年合入 Linux 5.1，是 Linux 近年来最重要的内核特性之一，被 liburing、Tokio(Rust)、libxev(Zig) 等用户态框架广泛采用。他目前在 Meta 工作，继续维护 io_uring 和块层子系统。
-:::
+| 路线 | 等待对象 | 应用收到什么 | 主要适用方式 |
+|------|----------|--------------|--------------|
+| `select` / `poll` | 每次提交的一组 fd | 当前就绪的 fd 状态 | 关注集合较小或需要可移植性 |
+| `epoll` | 内核保存的关注集合 | 就绪列表中的事件 | 大量长期注册、少量活跃 fd |
+| `io_uring` | 已提交的具体操作 | 每项操作的完成结果 | 批量、完成式 I/O 与统一事件循环 |
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| I/O 模型 | 阻塞、非阻塞、多路复用、异步四种，核心区别在于等待方式 |
-| select | 最早的多路复用 API，位图实现，`FD_SETSIZE` 限制，O(n) 扫描 |
-| poll | 去掉了 fd 数量限制，输入/输出分离，但仍 O(n) 扫描 |
-| epoll | 红黑树 + 就绪链表，O(1) 事件通知，有状态，支持 LT/ET 模式 |
-| 事件循环(event loop) | 单线程循环：`epoll_wait` → 分发回调 → 返回。回调必须非阻塞 |
-| io_uring | 共享 SQ/CQ 环形缓冲区，SQPOLL 模式可实现零系统调用异步 I/O |
+| I/O 语义 | 分别描述调用是否等待，以及通知代表就绪还是完成 |
+| 阻塞与非阻塞 | 不能立即推进时，线程睡眠等待或返回 `EAGAIN` |
+| 就绪与完成 | 就绪要求应用再次执行 I/O，完成直接给出已提交操作的结果 |
+| select | 用固定大小集合同时等待多类 fd，返回时改写输入集合 |
+| poll | 用动态数组分离关注事件与返回事件，但每次仍扫描整个数组 |
+| epoll | 在内核保存关注列表，并从就绪列表交付事件 |
+| LT 与 ET | LT 在条件持续成立时可重复报告，ET 要求处理到 `EAGAIN` |
+| 事件循环 | 等待事件、有限分派并保存每项工作的状态 |
+| 背压 | 下游变慢时限制继续接收工作，防止队列无界增长 |
+| io_uring | 通过共享 SQ/CQ 批量提交操作并取得 CQE 完成结果 |
+| SQPOLL | 由内核线程轮询提交队列，可减少提交系统调用但消耗 CPU |
 
-事件驱动的本质是用一个线程复用大量连接的等待时间：select/poll 用遍历实现了多路复用，epoll 用回调和就绪链表消除了遍历开销，io_uring 用共享环形缓冲区消除了系统调用本身的开销。从 select 到 io_uring，每一步都在减少"等待"这件事的代价。
+事件驱动并发并不是把线程替换成一个更快的接口，而是把“等待哪个条件、谁保存进度、何时限制生产速度”变成显式协议：就绪接口复用等待，事件循环管理状态，完成接口再把具体 I/O 纳入同一套生命周期。
 
 ---
 
-**Linux 源码入口**：
-- [`fs/select.c`](https://elixir.bootlin.com/linux/latest/source/fs/select.c) — `do_select()`：select/poll 内核实现，线性扫描所有 fd
-- [`fs/eventpoll.c`](https://elixir.bootlin.com/linux/latest/source/fs/eventpoll.c) — `ep_poll()`、`ep_insert()`：epoll 核心，红黑树 + 就绪链表
-- [`io_uring/`](https://elixir.bootlin.com/linux/latest/source/io_uring/) — io_uring 子系统，SQ/CQ 环形缓冲区管理
-- [`io_uring/sqpoll.c`](https://elixir.bootlin.com/linux/latest/source/io_uring/sqpoll.c) — SQPOLL 内核轮询线程实现
+**Linux 接口与源码入口**：
+- [`select(2)`](https://man7.org/linux/man-pages/man2/select.2.html)：`fd_set`、`nfds`、`FD_SETSIZE` 与偶发就绪误报
+- [`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html)：`pollfd.events`、`pollfd.revents` 与返回事件语义
+- [`epoll(7)`](https://man7.org/linux/man-pages/man7/epoll.7.html)：关注列表、就绪列表、LT 与 ET 的接口语义
+- [`fs/eventpoll.c`](https://github.com/torvalds/linux/blob/master/fs/eventpoll.c)：epoll 关注项、回调、就绪队列与等待实现
+- [`io_uring(7)`](https://man7.org/linux/man-pages/man7/io_uring.7.html)：SQE、CQE 与完成式编程模型
+- [`io_uring_enter(2)`](https://man7.org/linux/man-pages/man2/io_uring_enter.2.html)：批量提交、等待完成与 CQE 结果
+- [`io_uring_setup(2)`](https://man7.org/linux/man-pages/man2/io_uring_setup.2.html)：共享队列、SQPOLL 与唤醒条件
+- [`io_uring/`](https://github.com/torvalds/linux/tree/master/io_uring)：io_uring 内核实现

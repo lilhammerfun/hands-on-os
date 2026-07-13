@@ -1,454 +1,238 @@
 # 进程组与会话
 
-- 写作时间：`2026-02-27 首次提交，2026-03-23 最近修改`
-- 当前字符：`17014`
+- 写作时间：`2026-02-27 首次提交，2026-07-13 最近修改`
+- 当前字符：`8034`
 
-上一课的信号是发给单个进程的。但日常操作中，我们经常需要同时控制一组进程。来看这样一个场景——在终端运行一个管道，然后按 Ctrl+C：
+[信号](/process/02-signal)既可以发给单个进程，也可以发给一组进程。后一种能力对 shell 很重要，因为一条管道通常包含多个进程：
 
-```
+```console
 $ sleep 100 | cat
 ^C
 $
 ```
 
-两个进程同时退出了。原因：Ctrl+C 让终端驱动向**前台进程组**(foreground process group)发送 SIGINT，组内所有进程都收到信号。
+`sleep` 和 `cat` 都因 Ctrl+C 结束，shell 自身却继续等待下一条命令。终端没有解析管道，也不知道这两个程序的业务关系；shell 在创建它们时，已经把二者放进同一个进程组，并让终端把该组记为前台目标。
 
-但这引出三个问题：
+本课先用**进程组**表达一个 shell job 中的全部进程，再看**控制终端**怎样选定唯一的前台组。shell 把这些机制组合成 **Job Control**，也就是 `jobs`、`fg`、`bg` 和 Ctrl+Z。随后用**会话**约束进程组与终端的归属，最后解释失去同会话外部父进程的**孤儿进程组**为什么需要特殊处理。
 
-1. 谁创建了这个"进程组"？
-2. 为什么 `sleep` 和 `cat` 在同一个组里？
-3. shell 自己在不在这个组里？
+这些对象形成严格层级：一个会话包含一个或多个进程组，一个进程组包含一个或多个进程；控制终端属于一个会话，并从该会话中选择一个进程组作为前台组。
 
-回答这三个问题需要四个概念。**进程组**把进程绑在一起，Ctrl+C 发出的信号才能同时到达组内所有进程。但谁决定哪个组接收键盘信号？这就是**控制终端**的职责——它记录谁是前台。进程组加控制终端，就构成了 **Job Control**：fg/bg/Ctrl+Z 的完整机制。多个进程组需要一个更大的容器来管理，这就是**会话**——终端关闭时，会话内所有进程都会收到通知。最后讨论一个边界情况：**孤儿进程组**。
-
-这些概念构成三级层次：会话 > 进程组 > 进程。控制终端绑在会话上，指向其中一个进程组作为前台。
+```text
+Session
+├── shell process group
+├── foreground job process group
+└── background job process group
+```
 
 ## 进程组
 
-进程组(process group)是一组共享同一个 PGID(Process Group ID) 的进程。PGID 等于组长的 PID。组长就是第一个加入（或创建）这个组的进程。
+进程组(process group)是共享同一个 PGID 的一组进程，也是 POSIX 向多个相关进程执行信号与等待操作的基本单位。
 
-回到开头的问题：`sleep 100 | cat` 加 Ctrl+C，两个进程同时退出。如果没有进程组，终端驱动要怎么做？它需要维护一个"当前前台进程列表"，在进程创建和退出时更新它，这会引入复杂的同步问题。进程组解决了三个问题：
+每个进程都属于一个进程组。`fork()` 创建的子进程先继承父进程的 PGID，exec 不改变 PGID；shell 随后用 `setpgid()` 把一个命令或整条管道放入新组。job 是 shell 管理的一条命令或管道，可能对应一个进程，也可能对应多个进程。
 
-**原子性**。终端驱动只知道一个 PGID。按 Ctrl+C 时，行规程执行一次 `kill(-pgid, sig)`。进程组把"谁属于前台"这个信息下放到每个进程自己的 PGID 字段里，终端驱动只需要记住一个数字。
+进程组组长(process group leader)是 PID 等于 PGID 的进程。shell 通常选择管道中第一个子进程的 PID 作为整组 PGID：
 
-**管道一致性**。`ls | sort | head` 是一个 job，三个进程应该作为一个整体被管理。用户按 Ctrl+C 期望三个都停，按 Ctrl+Z 期望三个都暂停。进程组让 shell 把一条管道中的所有进程放进同一个组，实现统一控制。
-
-**前台/后台区分**。终端只有一个"前台进程组"。其他进程组都是后台。这个区分让 shell 能同时管理多个 job：前台 job 能读写终端，后台 job 不能读终端（否则多个 job 同时读 stdin 会混乱）。
-
-```
-Process Group (PGID = 200)
-├── sleep  PID=200  ← leader (PGID == PID)
+```text
+Process group PGID=200
+├── sleep  PID=200  group leader
 └── cat    PID=201
 ```
 
-那么 `sleep 100 | cat` 的进程组是谁创建的？答案是 shell。shell 每启动一个 job（无论是单个命令还是一条管道），都会为它创建一个新的进程组。以 `ls | grep foo` 为例：
+“组长”是 ID 关系，不代表它负责调度或管理其他成员。即使 PID 200 先退出，只要组内还有其他进程，PGID 200 仍可以继续存在。
 
-1. shell fork 出子进程 A（PID 300）来执行 `ls`，fork 出子进程 B（PID 301）来执行 `grep`
-2. 第一个子进程 A 的 PID（300）作为整个 job 的 PGID
-3. shell 调用 `setpgid(300, 300)` 和 `setpgid(301, 300)`，把 A 和 B 都放进 PGID=300 的组
-4. 子进程 A 和 B 也分别调用 `setpgid(0, 300)` 把自己放进这个组
-
-为什么 shell 和子进程**都要调用** `setpgid`？这里有一个容易忽略的竞态(race condition)。fork 返回后，不确定是父进程先执行还是子进程先执行。如果只有 shell 调用，子进程可能在 shell 来得及设置之前就执行了 exec，那时它还在 shell 的进程组里。如果只有子进程调用，shell 可能在子进程设置之前就调用了 `tcsetpgrp`（后文控制终端一节会讲），把一个还不存在的进程组设为前台。两边都调用，谁先执行都能正确建组。后执行的那个调用会发现 PGID 已经对了，相当于空操作。
-
-相关系统调用：
-
-| 调用 | 作用 |
-|------|------|
-| `setpgid(pid, pgid)` | 把进程 pid 放进 pgid 进程组。pid=0 表示自己。pgid=0 表示用 pid 自身的 PID 做 PGID（即创建新组并当组长） |
-| `getpgid(pid)` | 查询进程 pid 的 PGID |
-| `getpgrp()` | 等价于 `getpgid(0)`，查询自己的 PGID |
-
-`kill()` 系统调用的第一个参数如果传**负数**，内核把它解释为 PGID，向该组的所有进程发信号：
+POSIX 提供以下接口：
 
 ```c
-kill(-300, SIGINT);   // send SIGINT to all processes in PGID=300
+#include <unistd.h>
+
+int setpgid(pid_t pid, pid_t pgid);
+pid_t getpgid(pid_t pid);
+pid_t getpgrp(void);
 ```
 
-用户进程通过 `kill()` 系统调用来发信号。行规程(line discipline)是内核代码，不需要走系统调用，它直接调用内核内部的 `kill_pgrp()` 函数，效果相同：向整个前台进程组发信号，不是逐个发。
+`pid = 0` 表示调用者自身，`pgid = 0` 表示使用目标进程 PID 作为 PGID。会话是包含一个或多个进程组的上层集合；一个进程只能把自己或尚未 exec 的直接子进程移入同一会话中的现有进程组，或者为目标创建以其 PID 为 PGID 的新组。会话一节会继续解释这个集合怎样与终端关联，这里先确定进程组不能跨越会话边界。
 
-:::expand 内核表示
+shell 创建 `ls | grep foo` 时，可以采用以下顺序：
 
-PGID 的存储路径是 `task_struct->signal->pids[PIDTYPE_PGID]`，涉及三个数据结构：
+1. fork 第一个子进程，假设 PID 为 300，并选定 PGID 300
+2. fork 第二个子进程，假设 PID 为 301
+3. 把 PID 300 与 PID 301 都设置为 PGID 300
+4. shell 保持在自己的进程组，不加入 PGID 300
+
+父进程和每个子进程通常都会调用相应的 `setpgid()`。原因是 fork 后谁先运行没有保证，这种结果取决于执行顺序的问题叫竞态条件(race condition)。如果只有父进程设置，子进程可能先 exec，父进程随后再修改它的 PGID 会得到 `EACCES`；如果只有子进程设置，父进程可能在进程组建立前就尝试把它设为终端前台组。双方都执行并检查返回结果，可以让两种调度顺序都得到正确分组。
+
+进程组建立后，负的 `kill()` 目标表示 PGID：
 
 ```c
-// include/linux/sched.h
-struct task_struct {
-    struct signal_struct  *signal;    // shared by thread group
-    // ...
-};
-
-// include/linux/sched/signal.h
-struct signal_struct {
-    struct pid  *pids[PIDTYPE_MAX];  // index: PID / TGID / PGID / SID
-    // ...
-};
-
-// include/linux/pid.h
-enum pid_type {
-    PIDTYPE_PID,   // 0 — process ID
-    PIDTYPE_TGID,  // 1 — thread group ID
-    PIDTYPE_PGID,  // 2 — process group ID  ← the one we care about
-    PIDTYPE_SID,   // 3 — session ID
-    PIDTYPE_MAX,	 // 4 — not a real type; C idiom: placed at end of enum as array size
-};
-
-struct pid {
-    refcount_t          count;            // reference count
-    unsigned int        level;            // namespace nesting depth
-    spinlock_t          lock;
-    struct hlist_head   tasks[PIDTYPE_MAX]; // reverse list: all tasks pointing to this pid
-    struct upid         numbers[];        // numeric values in each namespace layer
-};
+kill(-300, SIGINT);
 ```
 
-每个进程对应一个 `task_struct`。`task_struct` 的 `signal->pids[]` 数组存放了这个进程的一组不同类型的 ID。同属于一个进程组的进程，它们的 `pids[PIDTYPE_PGID]` 是相同的，都指向**同一个** `struct pid` 实例：
-
-```
-task_struct (sleep, PID=200)          task_struct (cat, PID=201)
-  └→ signal->pids[PGID] ──┐            └→ signal->pids[PGID] ──┐
-                           │                                    │
-                           ▼                                    ▼
-                       ┌──────────────────────────────────────────┐
-                       │ struct pid  (represents PGID=200)        │
-                       │   tasks[PGID]: sleep ←→ cat             │
-                       │   numbers[0].nr = 200                   │
-                       └──────────────────────────────────────────┘
-```
-
-所以进程组不是一个单独的内核对象。说白了，所谓进程组，就是一群 `pids[PIDTYPE_PGID]` 相同的进程。`setpgid()` 做的事就是改写进程的 `pids[PIDTYPE_PGID]` 的值，让它指向另一个 `struct pid`。改完之后这个进程就属于新的进程组了。
-
-:::
+这个调用请求内核向 PGID 300 中有权接收该信号的进程发送 `SIGINT`。`killpg(300, SIGINT)` 提供等价的组级接口。管道成员共享 PGID 后，终端和 shell 都不需要保存“应该通知哪些 PID”的临时列表。
 
 ## 控制终端
 
-控制终端(controlling terminal)是进程所关联的终端设备，在内核中是一个 PTY 从端设备对象。每个终端窗口对应一个控制终端，存储在 `task_struct->signal->tty` 字段里，是一个指向 `struct tty_struct` 的指针。同一个终端窗口中的所有进程共享这个指针。
+控制终端是与一个会话关联的 TTY 设备，它记录该会话当前唯一的前台进程组。
 
-前面讲了进程组把进程绑在一起。但终端里同时有多个进程组：一个前台组，若干后台组。按 Ctrl+C 只杀前台，不影响后台。终端驱动怎么知道谁是前台？答案就在 `tty_struct` 里。
+一个会话至多拥有一个控制终端，一个终端也至多控制一个会话。同一会话中只有一个进程组是前台组，其余都是后台组。终端生成的 `SIGINT`、`SIGQUIT` 和 `SIGTSTP` 都发送给前台组，后台组不会因为用户在当前终端按下这些控制键而收到相同信号。
 
-控制终端的作用体现在 `struct tty_struct` 的两个关键字段上：
+`tcgetpgrp()` 与 `tcsetpgrp()` 读取或修改终端的前台 PGID：
 
 ```c
-// include/linux/tty.h (simplified)
-struct tty_struct {
-    struct pid  *pgrp;     // foreground process group (pgrp = Process GRouP)
-    struct pid  *session;  // owning session
-    // ...
-};
+#include <unistd.h>
+
+pid_t tcgetpgrp(int fd);
+int tcsetpgrp(int fd, pid_t pgrp);
 ```
 
-**pgrp：路由键盘信号。** 用户按 Ctrl+C 时，行规程需要知道信号该发给谁。它从 `tty->pgrp` 取出前台进程组，调用 `kill_pgrp(tty->pgrp, SIGINT)` 发信号。终端驱动不知道"哪些进程在前台"，它只知道 `tty->pgrp` 这一个指针。
+`fd` 必须引用调用进程的控制终端，`pgrp` 必须是调用者所在会话中的非空进程组。交互式 shell 通常使用连接控制终端的 fd 0，但重定向可能改变 fd 0、1、2 的去向，因此不能把“任意标准 fd 永远都可用”当作接口保证。
 
-**session：终端断开时通知会话。** 关闭终端窗口时，内核从 `tty->session` 找到 session leader，向它发送 SIGHUP。会话的细节在后文展开。
-
-进程组和控制终端这两块拼图都有了。现在可以画出 Ctrl+C 从键盘到进程的完整路径，每一步都是前面讲过的机制在起作用：
+前台归属同时控制终端信号和终端读取：
 
 ```mermaid
-sequenceDiagram
-    participant U as User
-    participant PTY as PTY
-    participant LD as Line Discipline
-    participant K as Kernel
-    participant FG as Foreground PG
-
-    U->>PTY: press Ctrl+C (byte 0x03)
-    PTY->>LD: byte reaches terminal driver
-    LD->>LD: check termios, 0x03 = INTR char
-    LD->>LD: read tty->pgrp, get foreground PG
-    LD->>K: kill_pgrp(tty->pgrp, SIGINT)
-    K->>FG: set pending bit for each process in group
-    FG->>FG: each process handles per its disposition
+flowchart LR
+    KEY["Ctrl+C"] --> TTY["TTY line discipline"]
+    TTY -->|"SIGINT"| FG["Foreground process group"]
+    BG["Background process group"] -->|"read controlling terminal"| TTY
+    TTY -->|"SIGTTIN"| BG
 ```
 
-shell 通过 `tcsetpgrp` 设置前台进程组。tc 是 **t**erminal **c**ontrol（终端控制）的缩写。`tcsetpgrp` 就是 "terminal control: set process group"。
+后台进程组尝试读取控制终端时，内核通常向整个组发送 `SIGTTIN`，其默认动作是停止进程。如果该组已经成为孤儿组，或者调用线程阻塞或忽略 `SIGTTIN`，读取可能改为失败并设置 `errno = EIO`。这条规则防止多个 job 同时争用交互输入。
 
-`tty->pgrp` 是谁设置的？是 shell。shell 通过以下系统调用操作控制终端上的 `pgrp` 字段：
-
-| 调用 | 作用 |
-|------|------|
-| `tcsetpgrp(fd, pgid)` | 改写 `tty->pgrp` 的值，把前台进程组设为 pgid |
-| `tcgetpgrp(fd)` | 读取 `tty->pgrp` 的值，查询当前前台进程组 |
-
-第一个参数 fd 要求是一个指向控制终端的文件描述符。shell 的 fd 0、1、2 都指向同一个 PTY 从端设备（后文会话一节会解释为什么），传哪个都行，效果完全一样。它们背后是同一个 `struct tty_struct`。用 `STDIN_FILENO`（fd 0）只是约定俗成的写法。
-
-shell 启动一个前台命令时：
-
-1. 为命令创建新进程组（`setpgid`）
-2. 调用 `tcsetpgrp(STDIN_FILENO, child_pgid)` 把 `tty->pgrp` 改为新进程组
-3. `waitpid` 等待命令结束
-4. 命令结束后，调用 `tcsetpgrp(STDIN_FILENO, shell_pgid)` 把 `tty->pgrp` 改回自己
-
-第 4 步容易遗漏。如果不做，终端的前台进程组指向一个已经不存在的 PGID，下一次 Ctrl+C 的信号会发给错误的目标（或者没有目标）。
-
-如果一个后台进程试图从终端读取输入，又会发生什么？
-
-终端驱动检测到读取者的 PGID 和 `tty->pgrp` 不一致，说明它不是前台进程组的成员。终端驱动不会让它读到数据，而是向该进程的进程组发送 **SIGTTIN**（Terminal Input）。SIGTTIN 的默认动作是停止(Stop)进程。
-
-```
-$ cat &             ← cat runs in background
-[1] 500
-$
-[1]+  Stopped         cat
-```
-
-`cat` 试图读 stdin，收到 SIGTTIN，被停止。
-
-类似地，后台进程试图写入终端时，如果终端设置了 `TOSTOP` 标志，内核向其发送 **SIGTTOU**（Terminal Output），同样停止进程。默认情况下 `TOSTOP` 未设置，后台进程可以直接写终端（所以后台 job 的输出会突然出现在屏幕上）。
-
-这两个信号的意义是：**保证同一时刻只有一个 job 在读终端**。否则多个 job 同时读 stdin，谁读到哪个字节就变成不确定的了。
+后台写终端默认允许，所以后台 job 的输出可能出现在提示符之间。若终端启用了 `TOSTOP`，后台写会生成 `SIGTTOU`。此外，后台进程调用 `tcsetpgrp()` 等终端控制操作时，即使没有启用 `TOSTOP`，只要没有阻塞或忽略 `SIGTTOU`，其进程组也会收到 `SIGTTOU`。shell 在交接前台归属时必须处理这项规则。
 
 ## Job Control
 
-Job control 是 shell 利用进程组和控制终端，在一个终端内管理多个 job（前台、后台、停止）的机制。
+Job Control 是 shell 以进程组为 job 单位，通过终端前台归属、信号和 `waitpid()` 管理运行、停止与继续状态的机制。
 
-一个典型场景：正在编译大项目 `make -j8`，编译要跑五分钟，但突然想看一下 `git log`。终端被 `make` 占着，打的字全被 `make` 吃掉了。开一个新终端窗口当然可以，但 job control 让你不用开新窗口就能切换任务。进程组把进程绑在一起，控制终端的 `tty->pgrp` 记录谁是前台。下面看 shell 怎么用这两个机制实现 fg/bg/Ctrl+Z。
+先看 shell 启动前台管道 `ls | grep foo` 的完整职责：
 
-按 Ctrl+Z：
+1. 创建管道，fork 两个子进程
+2. 让两个子进程进入同一个新进程组
+3. 子进程连接 fd、恢复目标程序应有的信号处置与掩码，再 exec
+4. shell 调用 `tcsetpgrp()` 把控制终端交给新进程组
+5. shell 用 `waitpid(-pgid, ..., WUNTRACED | WCONTINUED)` 等待组内子进程状态
+6. job 终止或停止后，shell 用 `tcsetpgrp()` 收回终端，并恢复 shell 的终端模式
 
-```
-$ make -j8
-^Z
-[1]+  Stopped                 make -j8
-$
-```
+`waitpid()` 的 pid 参数为负数时，绝对值表示目标进程组。`WUNTRACED` 让停止状态也能返回，`WCONTINUED` 让 `SIGCONT` 引起的继续状态也能返回。shell 必须汇总组内所有进程的状态，不能因为管道中的第一个进程退出就认定整个 job 已经结束。
 
-`make` 停住了，shell 回来了。Ctrl+Z 和 Ctrl+C 的路径几乎相同（回顾控制终端一节的 Ctrl+C 路径图），区别只在信号类型：Ctrl+C 发 SIGINT（终止），Ctrl+Z 发 SIGTSTP（Terminal Stop，区别于 SIGSTOP，SIGTSTP 可以被进程捕获）。行规程调用 `kill_pgrp(tty->pgrp, SIGTSTP)`，前台进程组的所有进程收到 SIGTSTP，默认动作是进入 Stopped 状态。进程还在，但不再运行。
+终端模式(termios state)包括规范输入、回显和控制字符配置。全屏编辑器可能在运行时关闭回显并启用原始模式；若它被 Ctrl+Z 停止，shell 收回前台时还要恢复自己的终端模式，否则新的提示符可能无法正常回显。恢复该 job 到前台时，shell 再把保存的 job 终端模式写回。
 
-shell 怎么知道进程停了？`waitpid` 有一个标志 `WUNTRACED`，加上这个标志后，`waitpid` 不仅在子进程退出时返回，在子进程被停止时也会返回。shell 检查返回状态发现是 Stopped，就把前台还给自己（`tcsetpgrp`），在内部的 job 表里记一笔，打印 `[1]+  Stopped`，然后显示提示符。
+Ctrl+Z 的路径是：行规程向前台组生成 `SIGTSTP`，组内进程按默认动作停止；`waitpid()` 因 `WUNTRACED` 返回；shell 记录 job 为 Stopped，收回控制终端并显示新提示符。进程没有退出，其地址空间和 fd 仍然存在。
 
-`make` 停着，`git log` 也查完了，想让它继续编译。有两种选择。
+`fg` 恢复一个停止的 job 时，shell 通常依次完成：
 
-**fg** 把 job 拉回前台继续运行：
+1. 把控制终端交给 job 的 PGID
+2. 恢复该 job 保存的终端模式
+3. 向整个进程组发送 `SIGCONT`
+4. 再次等待它停止或终止
 
-```
-$ fg %1
-make -j8        ← back to foreground, terminal occupied by make
-```
+`bg` 只让 job 在后台继续运行：shell 发送 `SIGCONT`，但不把控制终端交给它，也不阻塞等待。由此，`fg` 与 `bg` 的区别不只是一次 `tcsetpgrp()`；前台操作还包含终端模式恢复和同步等待。
 
-shell 做了两件事：调用 `tcsetpgrp(STDIN_FILENO, make_pgid)` 把 `tty->pgrp` 改成 `make` 的进程组，然后调用 `kill(-make_pgid, SIGCONT)` 向整个进程组发送 SIGCONT，让 Stopped 的进程恢复运行。然后 shell 调用 `waitpid` 等待这个 job 结束（或再次被 Ctrl+Z 停住）。
+命令末尾的 `&` 直接创建后台 job。shell 仍会建组和记录状态，但不交出控制终端，也不等待该 job 完成。后台子进程的状态随后通过 `SIGCHLD` 和非阻塞 `waitpid()` 更新。
 
-**bg** 让 job 在后台继续运行：
-
-```
-$ bg %1
-[1]+ make -j8 &    ← running in background, shell returns immediately
-$                   ← you can continue typing other commands
-```
-
-shell 只做了一件事：调用 `kill(-make_pgid, SIGCONT)` 发 SIGCONT 让进程恢复。注意 shell **没有**调用 `tcsetpgrp`。`tty->pgrp` 还是 shell 自己，键盘信号还是发给 shell。`make` 在后台默默运行，不占终端。
-
-所以 fg 和 bg 的区别就是**一个 `tcsetpgrp`**：fg 把前台交给 job，bg 不交。这个差异很小，但理解它意味着理解了整个 job control 的核心。
-
-除了先运行再 Ctrl+Z，也可以一开始就让命令在后台运行。末尾加 `&` 告诉 shell：创建进程组、启动命令，但**不调用 `tcsetpgrp`**，前台留给 shell。这和"先前台运行再 bg"的最终效果一样，只是跳过了中间的 Stopped 状态。
-
-`jobs` 打印 shell 内部的 job 表，不涉及任何系统调用。shell 维护一个数据结构，记录每个 job 的编号、PGID、状态（Running / Stopped）和命令行文本。`%1`、`%2` 就是这个 job 编号，fg 和 bg 用它来指定操作哪个 job。
+`jobs` 主要读取 shell 自己维护的 job 表。该表把 `%1` 这样的 job 编号映射到 PGID、命令文本以及每个成员的 Running、Stopped 或 Done 状态；内核只提供 PID、PGID、信号与等待状态，不替 shell 维护用户可见的 job 编号。
 
 ```mermaid
 flowchart LR
     FG["Foreground"]
     BG["Background"]
     ST["Stopped"]
+    END["Done"]
 
-    FG -->|"Ctrl+Z<br/>SIGTSTP"| ST
-    ST -->|"fg<br/>SIGCONT + tcsetpgrp"| FG
-    ST -->|"bg<br/>SIGCONT"| BG
-    BG -->|"fg<br/>tcsetpgrp"| FG
-    FG -->|"exit / signal"| END["Exited"]
-    BG -->|"exit / signal"| END
-    BG -->|"read terminal<br/>SIGTTIN"| ST
+    FG -->|"Ctrl+Z / SIGTSTP"| ST
+    ST -->|"fg / terminal + SIGCONT + wait"| FG
+    ST -->|"bg / SIGCONT"| BG
+    BG -->|"fg / terminal + wait"| FG
+    BG -->|"terminal read / SIGTTIN"| ST
+    FG -->|"exit or terminating signal"| END
+    BG -->|"exit or terminating signal"| END
 ```
 
-每条箭头上方标注的是用户操作或事件，下方是 shell/内核实际执行的系统调用或信号。回顾上面的讲解，每条箭头都应该能说出具体机制。
-
-注意最后一条边：后台 job 如果试图读终端（控制终端一节讲的 SIGTTIN），会被停止，进入 Stopped 状态。这时候可以用 fg 把它拉到前台再继续。
-
-把前面各节的知识组合起来，看 shell 执行一条管道命令 `ls | grep foo` 的完整过程：
-
-```mermaid
-sequenceDiagram
-    participant SH as Shell (PID=100, PGID=100)
-    participant C1 as Child ls (PID=200)
-    participant C2 as Child grep (PID=201)
-
-    SH->>SH: pipe() create pipe
-
-
-    SH->>C1: fork()
-    SH->>SH: setpgid(200, 200) create group
-    C1->>C1: setpgid(0, 200) create group (race guard)
-    C1->>C1: redirect stdout to pipe write end
-    C1->>C1: reset signal dispositions to SIG_DFL
-    C1->>C1: exec("ls")
-
-    SH->>C2: fork()
-    SH->>SH: setpgid(201, 200) join group
-    C2->>C2: setpgid(0, 200) join group (race guard)
-    C2->>C2: redirect stdin to pipe read end
-    C2->>C2: reset signal dispositions to SIG_DFL
-    C2->>C2: exec("grep")
-
-    SH->>SH: tcsetpgrp(stdin, 200) set foreground
-    SH->>SH: waitpid(-200, WUNTRACED) wait for job
-
-    Note over C1,C2: commands executing...
-
-    C1-->>SH: exit
-    C2-->>SH: exit
-    SH->>SH: tcsetpgrp(stdin, 100) reclaim foreground
-    SH->>SH: display prompt
-```
-
-Shell 在启动时必须忽略三个信号：
-
-| 信号 | 为什么忽略 |
-|------|-----------|
-| SIGTSTP | 用户按 Ctrl+Z 时，shell 不能被暂停（否则谁来恢复它？） |
-| SIGTTOU | shell 把前台交给子进程组后，自己就变成后台了。前台 job 结束后，shell 需要调 `tcsetpgrp` 收回前台，但此刻 shell 还在后台。`tcsetpgrp` 内部通过 ioctl 修改终端属性，内核把这视为对终端的写操作，会向后台调用者发 SIGTTOU。不忽略的话，shell 恰恰在收回前台的那一刻把自己卡死 |
-| SIGTTIN | POSIX 对 job control shell 的推荐防护。正常情况下 shell 把前台交出去后阻塞在 `waitpid`，不会读终端，SIGTTIN 不会触发。但忽略它可以防止未来加功能时意外触发 |
-
-加上 SIGINT，shell 启动时至少忽略四个信号。子进程在 fork 后、exec 前要把这些信号全部重置为 SIG_DFL。
-
-前台 job 退出后，shell 必须立即调用 `tcsetpgrp(STDIN_FILENO, shell_pgid)` 把前台进程组设回自己。如果不做这一步，终端的前台进程组指向一个已经不存在的 PGID，下一次 Ctrl+C 的信号会发给错误的目标（或者没有目标）。
+交互式 job-control shell 通常忽略 `SIGTSTP`、`SIGTTIN` 与 `SIGTTOU`，并为 `SIGINT`、`SIGQUIT` 等信号设置自己的策略。这样它在管理终端时不会被作业控制信号意外停止。子进程在 exec 前必须恢复普通命令应有的默认处置和掩码，否则会继承 shell 的管理策略。
 
 ## 会话
 
-会话(session)是包含多个进程组的更大容器，由 session leader 创建，绑定一个控制终端。SID(Session ID) 等于 session leader 的 PID，session leader 通常是 shell 进程。
+会话(session)是一个或多个进程组的集合，用会话 ID(Session ID, SID)标识，并且可以拥有一个控制终端。
 
-换个角度想：一个 shell 窗口里可能有多个 job：一个前台、若干后台。这些 job（进程组）加上 shell 自己，构成一个会话。为什么需要这一层？关闭终端窗口时，所有 job 都应该收到 SIGHUP。内核需要知道"哪些进程组属于这个终端"，会话就是这个跟踪单位。
+创建会话的进程是会话首进程(session leader)，其 PID 等于新 SID。它同时成为新进程组的组长，所以刚创建时满足 `PID = PGID = SID`，并且新会话和新进程组都只有调用者一个成员。
 
-```
-┌─────────────────────────────────────────────────────┐
-│ Session (SID = 100)                                 │
-│                                                     │
-│  ┌──────────────────┐  ┌──────────────────────────┐  │
-│  │ Process Group    │  │ Process Group            │  │
-│  │ PGID=100         │  │ PGID=300                 │  │
-│  │                  │  │                          │  │
-│  │  bash (PID=100)  │  │  sleep (PID=300, leader) │  │
-│  │  (session        │  │  cat   (PID=301)         │  │
-│  │   leader)        │  │                          │  │
-│  └──────────────────┘  └──────────────────────────┘  │
-│                                                      │
-│  ┌──────────────────────────┐                        │
-│  │ Process Group PGID=400   │                        │
-│  │                          │                        │
-│  │  find (PID=400, leader)  │  ← background job      │
-│  └──────────────────────────┘                        │
-└─────────────────────────────────────────────────────┘
+```text
+Session SID=100
+├── Process group PGID=100
+│   └── shell PID=100, session leader
+├── Process group PGID=300
+│   ├── sleep PID=300
+│   └── cat PID=301
+└── Process group PGID=400
+    └── find PID=400
 ```
 
-三级层次：会话包含多个进程组，进程组包含多个进程。
+会话边界让内核能够约束两件事：一个终端的前台组必须来自拥有该终端的同一会话；`setpgid()` 也不能把进程移到其他会话的进程组。它不是“终端内全部进程”的动态搜索结果，而是 fork、`setpgid()` 与 `setsid()` 持续维护的身份关系。
 
-进程调用 `setsid()` 创建一个新会话。调用后：
+`setsid()` 创建新会话：
 
-1. 调用者成为新会话的 session leader
-2. 调用者成为新进程组的组长（PGID = PID = SID）。为什么要同时创建进程组？因为每个进程必须属于某个进程组，而旧的进程组属于旧会话，调用者需要一个属于新会话的进程组来容身
-3. 内核把调用者的 `signal->tty` 设为 NULL。新会话没有控制终端。旧的控制终端属于旧会话（那个 `tty_struct` 的 `session` 字段指向旧 session leader），不会带到新会话来。要获得控制终端，需要在 `setsid()` 之后主动 `open("/dev/pts/N")`（见下文终端模拟器启动序列的第 3、4 步）
+```c
+#include <unistd.h>
 
-限制：已经是进程组组长的进程不能调用 `setsid()`。原因是 `setsid()` 会创建一个新进程组，PGID = 调用者的 PID。但组长的 PID 已经等于当前的 PGID，老的进程组里可能还有其他成员在用这个 PGID。如果再创建一个同样 PGID 的新组，内核就无法区分新组和老组了。
-
-打开一个终端窗口（如 iTerm2）时，这些机制全部串联起来：
-
-1. 终端模拟器创建一对 PTY(pseudo-terminal)
-2. 终端模拟器 fork 一个子进程
-3. 子进程调用 `setsid()`，创建新会话，自己成为 session leader
-4. 子进程调用 `open("/dev/pts/N")` 获得从端的 fd。**这一步同时触发了控制终端的自动绑定**，不需要额外的系统调用
-
-:::thinking open() 怎么就自动绑定了控制终端？
-内核在 open 时检查四个条件，全部满足就自动绑定：
-
-1. 打开的是**终端设备**（不是普通文件）。不限于 `/dev/pts/N`，虚拟控制台（`/dev/tty1`）、串口（`/dev/ttyS0`）都算
-2. 调用者是 **session leader**
-3. 调用者**还没有控制终端**
-4. 没有传 `O_NOCTTY` 标志
-
-四个条件缺一不可。`setsid()` 创建了满足条件 2 和 3 的状态，紧接着 `open` 终端设备就触发绑定。如果不想要这个行为（比如 daemon 进程），open 时加 `O_NOCTTY` 即可跳过。
-:::
-5. 子进程用 `dup2` 把这个 fd 复制到 0、1、2 三个位置（见下文解释）
-6. 子进程 exec 执行 shell（如 bash、zsh）
-7. 从此，shell 的 stdin/stdout/stderr 都指向 PTY 从端，shell 是这个会话的 session leader
-
-上面第 4、5 步把 PTY 从端连接到 shell 的标准 I/O。子进程需要用 `open` 打开 PTY 从端，再用 `dup2` 把它复制到 fd 0/1/2：
-
-```
-setsid()                        // create new session, detach from old terminal
-int fd = open("/dev/pts/0")     // open PTY slave, suppose returns fd=3
-                                // kernel: caller is session leader without controlling terminal
-                                //       → auto-bind /dev/pts/0 as controlling terminal
-dup2(fd, 0)                     // fd table[0] → /dev/pts/0  (stdin)
-dup2(fd, 1)                     // fd table[1] → /dev/pts/0  (stdout)
-dup2(fd, 2)                     // fd table[2] → /dev/pts/0  (stderr)
-close(fd)                       // fd=3 no longer needed, close it
-exec("bash")                    // replace with shell, fd table preserved
+pid_t setsid(void);
 ```
 
-`open` 返回最小空闲 fd（这里是 3），`dup2` 把它复制到 0、1、2，然后关掉原始 fd。exec 后，shell 的 fd 0/1/2 全部指向 PTY 从端。shell 调用 `read(0, ...)` 读用户输入，实际是在读 PTY 从端。shell 调用 `write(1, ...)` 输出内容，实际是在写 PTY 从端。终端模拟器从主端读到这些内容，显示在屏幕上。
+调用成功后，调用者成为新会话首进程和新进程组组长，并脱离原控制终端；新会话最初没有控制终端。已经是进程组组长的进程不能调用 `setsid()`，否则它离开原会话时会把原进程组拆到两个会话中，破坏“一个进程组只能属于一个会话”的层级。需要确保成功的程序通常先 fork，再由不是组长的子进程调用 `setsid()`。
 
-```
-Process fd table (shell after exec)
-┌────┬──────────────────────┐
-│ 0  │  → /dev/pts/0        │ ← stdin: reads user input from here
-├────┼──────────────────────┤
-│ 1  │  → /dev/pts/0        │ ← stdout: writes output here
-├────┼──────────────────────┤
-│ 2  │  → /dev/pts/0        │ ← stderr: writes errors here
-└────┴──────────────────────┘
-         all point to the same PTY slave
-```
+Linux 上，一个没有控制终端的会话首进程打开终端设备时，如果没有使用 `O_NOCTTY`，且该终端尚未属于其他会话，它通常会取得该终端作为控制终端。程序也可以用 `TIOCSCTTY` ioctl 显式完成这一步。ioctl 是对设备执行特定控制操作的系统调用接口。
 
-这就是为什么控制终端一节说"shell 的 fd 0、1、2 都指向同一个 PTY 从端设备"。`tcsetpgrp` 的第一个参数传 fd 0、1、2 哪个都行，因为它们背后是同一个 `struct tty_struct`。
+终端模拟器建立 shell 环境时，常见逻辑可以概括为：先创建一对伪终端主端和从端，再 fork 子进程；子进程调用 `setsid()`，取得从端作为控制终端，把从端复制到 fd 0、1、2，再 exec shell。具体实现可能由 `forkpty()` 或 `login_tty()` 等库函数封装，但最终仍要建立 SID、PGID、控制终端和标准 fd 这四层关系。
+
+终端挂断不会自动向会话中的所有进程组逐一发送 `SIGHUP`。Linux 在符合终端配置的挂断条件下向会话首进程发送 `SIGHUP`；会话首进程退出时，内核向控制终端的前台进程组发送 `SIGHUP`。shell 还可以按自身策略把 `SIGHUP` 传播给它记录的其他 job。区分内核规则与 shell 策略，才能解释为什么不同 shell 的后台 job 在终端关闭后可能表现不同。
 
 ## 孤儿进程组
 
-孤儿进程组(orphan process group)是指与同会话中其他进程组之间不再有父子关系的进程组。POSIX 的精确定义：一个进程组，如果组内**每个成员**的父进程要么也在组内，要么不在同一个会话中，则该组是孤儿进程组。没有任何外部进程能对它做 `waitpid` 或发送 `SIGCONT`。
+孤儿进程组(orphaned process group)是这样一个进程组：组内每个成员的父进程要么也在该组内，要么属于另一个会话。
 
-考虑这个场景：
+这里的“孤儿”描述整个组在当前会话中的父子连接，不等同于“父进程已经退出”的孤儿进程。一个进程组即使所有成员都有存活父进程，也可能因为那些父进程位于其他会话而成为孤儿组；反过来，只要组内某个成员仍有父进程位于同一会话的另一个组，它就不是孤儿组。
 
-```bash
-$ bash              # start child shell (PID=500)
-$ sleep 100 &       # start background job in child shell
-[1] 501
-$ sleep 200         # run foreground command in child shell
-^Z                  # Ctrl+Z suspends sleep 200
-[2]+  Stopped       sleep 200
-$ exit              # exit child shell
+考虑同一会话中的两组进程：
+
+```text
+PGID=100: shell PID=100
+    └── parent of PID 200
+
+PGID=200: stopped job PID=200
 ```
 
-子 shell 退出了，但 `sleep 200`（PID=502）还处于 Stopped 状态。它的进程组里没有任何进程的父进程还在同一个会话中活跃。谁来恢复它？没有人能对它执行 `fg`。这个进程组变成了孤儿进程组。
+此时 PGID 200 不是孤儿组，因为 PID 200 的父进程 PID 100 位于同一会话的另一个进程组。若 shell 退出，PID 200 被重新指定给该会话之外的进程作为父进程，PGID 200 就满足孤儿组定义。系统里仍可能有进程有权限向它发送信号，但已经没有同会话、组外的父进程能够按原 job-control 关系等待和恢复它。
 
-当一个进程组变成孤儿进程组时，如果组内有任何处于 Stopped 状态的进程，内核会：
+如果进程退出导致某个进程组刚刚成为孤儿组，并且组内至少有一个成员处于停止状态，内核会依次向组内每个进程发送：
 
-1. 向该组发送 **SIGHUP**（通知"你的控制方已经不在了"）
-2. 紧接着发送 **SIGCONT**（让 Stopped 的进程恢复运行，以便响应 SIGHUP）
+1. `SIGHUP`，通知原有作业控制关系已经消失
+2. `SIGCONT`，让停止的进程恢复并有机会处理挂起的 `SIGHUP`
 
-SIGHUP 的默认动作是终止进程。所以通常结果是：Stopped 的孤儿进程被唤醒，然后立即被 SIGHUP 杀死。
-
-为什么要先 SIGHUP 再 SIGCONT？这个顺序不是随意的。如果只发 SIGCONT，Stopped 的进程恢复运行后没有人管理它（没有 shell 能 fg/bg 它），它会成为一个失控的进程。如果只发 SIGHUP，进程处于 Stopped 状态收不到信号（Stopped 的进程不处理信号，除了 SIGKILL 和 SIGCONT）。所以必须两个都发：SIGHUP 标记为待处理，SIGCONT 让进程恢复，恢复后处理 pending 的 SIGHUP 然后退出。
+`SIGHUP` 的默认动作是终止，许多程序因此在恢复后结束；安装处理函数的程序也可以选择其他行为。若新孤儿组没有停止成员，POSIX 不要求因这次转换发送这两个信号。这个规则的目标很具体：避免停止中的进程组在失去同会话父进程后永久无法继续。
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| 进程组(Process Group) | 共享同一个 PGID 的进程集合，PGID = 组长的 PID |
-| 会话(Session) | 包含多个进程组，绑定一个控制终端，SID = session leader 的 PID |
-| 控制终端(Controlling Terminal) | 会话与用户交互的通道，负责发送键盘信号 |
-| 前台进程组(Foreground Process Group) | 终端上当前接收键盘信号的进程组 |
-| `setpgid()` | 设置进程的 PGID |
-| `setsid()` | 创建新会话 |
-| `tcsetpgrp()` / `tcgetpgrp()` | 设置/查询终端的前台进程组 |
-| SIGTTIN / SIGTTOU | 后台进程读/写终端时被停止 |
-| Job Control | shell 通过进程组 + 信号 + tcsetpgrp 管理前台/后台/停止三个状态 |
-| 孤儿进程组(Orphan Process Group) | 与同会话其他进程组无父子连线的组，内核发 SIGHUP + SIGCONT |
+| 进程组 | 共享 PGID 的进程集合，也是 shell job 的内核控制单位 |
+| 组长 | PID 等于 PGID 的进程；退出后进程组仍可继续存在 |
+| 控制终端 | 与一个会话关联，并记录唯一前台进程组的 TTY |
+| 前台进程组 | 接收终端控制信号并有权读取终端的进程组 |
+| `setpgid()` | 在同一会话中创建进程组或移动进程 |
+| `tcsetpgrp()` | 把同会话中的非空进程组设为终端前台组 |
+| Job Control | shell 用进程组、终端、信号与等待状态管理 job |
+| 会话 | 包含一个或多个进程组、可拥有控制终端的 SID 集合 |
+| `setsid()` | 创建新会话和新进程组，并脱离原控制终端 |
+| 孤儿进程组 | 组内成员不再有同会话、组外父进程的进程组 |
 
-进程组、会话、控制终端三个概念构成一个三级层次结构。终端驱动只和一个 PGID 交互，shell 通过 `setpgid` 和 `tcsetpgrp` 两个系统调用在这个层次结构上操作，就实现了完整的 job control。fg/bg/jobs 不是魔法，它们各自只做一两个系统调用。
+进程组确定“一次控制哪些进程”，控制终端确定“当前控制哪个组”，会话则限制这些组与终端能够怎样组合；shell 的 Job Control 正是对这三层关系的持续维护。
 
-**Linux 源码入口**：
-- [`kernel/exit.c`](https://elixir.bootlin.com/linux/latest/source/kernel/exit.c) — `exit_notify()` → `kill_orphaned_pgrp()`：孤儿进程组处理
-- [`kernel/sys.c`](https://elixir.bootlin.com/linux/latest/source/kernel/sys.c) — `setpgid()`、`setsid()`：进程组和会话的创建
-- [`drivers/tty/tty_jobctrl.c`](https://elixir.bootlin.com/linux/latest/source/drivers/tty/tty_jobctrl.c) — `tty_check_change()`：SIGTTIN/SIGTTOU 检查
+---
 
-:::practice 给 zish 加上 Job Control
-学完本课，你已经知道进程组、控制终端和 Job Control 是怎么回事了。现在可以给 zish 加上 fg/bg/jobs、Ctrl+Z 和后台命令支持。
-
-前往 [zish-02：Job Control](/zish/02-job-control) 继续实践。
-:::
-
+**Linux 与 POSIX 入口**：
+- [`kernel/exit.c`](https://elixir.bootlin.com/linux/latest/source/kernel/exit.c)：`kill_orphaned_pgrp()`，孤儿进程组处理
+- [`kernel/sys.c`](https://elixir.bootlin.com/linux/latest/source/kernel/sys.c)：`setpgid()` 与 `setsid()` 的内核实现
+- [`drivers/tty/tty_jobctrl.c`](https://elixir.bootlin.com/linux/latest/source/drivers/tty/tty_jobctrl.c)：终端前后台检查
+- [`setpgid(2)`](https://man7.org/linux/man-pages/man2/setpgid.2.html)：PGID 设置规则与孤儿组语义
+- [`tcsetpgrp(3)`](https://man7.org/linux/man-pages/man3/tcsetpgrp.3.html)：终端前台组接口与约束
+- [`setsid(2)`](https://man7.org/linux/man-pages/man2/setsid.2.html)：会话创建和终端挂断规则
+- [`credentials(7)`](https://man7.org/linux/man-pages/man7/credentials.7.html)：PID、PGID、SID 与控制终端总览

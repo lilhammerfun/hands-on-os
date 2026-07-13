@@ -5,4 +5,5 @@ RUN apt-get update \
         procps \
         strace \
         util-linux \
+        liburing-dev \
     && rm -rf /var/lib/apt/lists/*

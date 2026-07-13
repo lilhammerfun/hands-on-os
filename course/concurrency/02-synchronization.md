@@ -1,559 +1,222 @@
 # 同步原语
 
-- 写作时间：`2026-03-04 首次提交，2026-03-23 最近修改`
-- 当前字符：`22667`
+- 写作时间：`2026-03-04 首次提交，2026-07-13 最近修改`
+- 当前字符：`8935`
 
-上一课说到，线程共享地址空间是一把双刃剑：数据共享变得容易，但多个线程同时读写同一个变量，结果就不可预测了。来看一个最直观的例子——两个线程各自对共享计数器执行一百万次 `counter++`，预期结果是两百万。实际会发生什么：
+[线程](/concurrency/01-thread)说明了同一进程中的执行流怎样共享地址空间。共享只让多个线程能够访问同一对象，却没有规定它们以什么顺序访问，也没有保证一组读写在其他线程看来不可分割。同步原语负责补上这些约束。
 
-```c
-#include <pthread.h>
-#include <stdio.h>
+来看两个线程分别执行一次 `counter++`。这条 C 表达式在语义上要先取得旧值、计算新值、再保存结果。如果两个线程都基于旧值 0 计算，它们可能先后写回 1，两个增量只留下一个。更严重的是，普通 C 对象上的这种并发读写构成数据竞争，编译器不必保留程序员设想的交错执行结果。
 
-int counter = 0;
+本课先通过 **竞态与临界区**确定要保护的共享不变量，再用 **原子操作与内存序**区分“单次更新不可分割”和“多次访问按什么顺序可见”。这些硬件与语言保证可以构造 **锁**；当线程等待的是状态变化而不是锁本身时，需要 **条件等待**。Linux 用户态库再用 **Futex** 连接用户态快速路径与内核阻塞路径，最后把这些机制放进 **经典同步问题**中组合使用。
 
-void *increment(void *arg) {
-    for (int i = 0; i < 1000000; i++)
-        counter++;
-    return NULL;
-}
+## 竞态与临界区
 
-int main() {
-    pthread_t t1, t2;
-    pthread_create(&t1, NULL, increment, NULL);
-    pthread_create(&t2, NULL, increment, NULL);
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
-    printf("counter = %d\n", counter);
-}
-```
+竞态条件是程序正确性依赖并发操作相对时序的情况；临界区(critical section)是必须按同步协议访问共享状态的一段代码。
 
-```
-$ gcc -O0 -pthread counter.c && ./a.out
-counter = 1325017
-$ ./a.out
-counter = 1481923
-$ ./a.out
-counter = 1379644
-```
+`counter++` 的丢失更新可以用一次允许出现的交错说明：
 
-counter 的值每次运行都不同，而且都比预期的两百万小。`counter++` 看起来是一条语句，但编译后是三条指令：从内存加载当前值到寄存器、寄存器加一、把结果写回内存。两个线程交错执行这三条指令时，就会丢失更新。
+| 顺序 | 线程 A | 线程 B | `counter` |
+|------|--------|--------|-----------|
+| 1 | 读取 0 | | 0 |
+| 2 | | 读取 0 | 0 |
+| 3 | 计算 1 | | 0 |
+| 4 | | 计算 1 | 0 |
+| 5 | 写入 1 | | 1 |
+| 6 | | 写入 1 | 1 |
 
-程序的结果取决于两个线程谁先执行、谁后执行，这就是**竞态条件**(race condition)。产生竞态的根源是那段访问共享变量的代码——**临界区**(critical section)。要消除竞态，就要保证同一时刻只有一个线程能执行临界区。但纯软件的互斥算法在现代 CPU 上会被指令重排破坏，所以需要**硬件原子操作**（内存屏障、CAS）来提供正确的底层保证。有了原子操作，就可以构建**自旋锁**(spinlock)——拿不到锁就原地循环等待。但忙等浪费 CPU，等待者应该让出 CPU 去睡眠，这就是**互斥锁**(mutex)的做法。mutex 解决了互斥，但有些场景不是等锁，而是等某个条件成立（比如"缓冲区非空"），这就需要**条件变量**(condition variable)和**信号量**(semaphore)。无论哪种原语，用户态的"检查并睡眠"都面临跨越用户态-内核态边界的原子性问题，Linux 的 **Futex** 系统调用正是为此而生——它是 glibc 中所有 pthread 同步原语的共同基础设施。最后，三个**经典同步问题**把这些原语组合在一起，展示真实并发场景下的设计模式。
+这里展示的是源代码层面的读、改、写语义，不代表编译器一定生成三条固定指令。由于两个线程无同步地访问同一个非原子 C 对象，且至少一个访问是写入，这还构成数据竞争；C 语言把这种程序的行为定义为未定义，编译器可以进行普通单线程代码中合法、但破坏上述推演的优化。
 
-## 竞态条件与临界区
+竞态条件与数据竞争不是同义词。数据竞争是语言内存模型中的特定违规；竞态条件是更广的逻辑问题。即使每个变量的单次读写都不会暴露中间状态，下面的“先检查余额，再扣款”仍可能因两个线程都通过检查而违反余额不为负的业务不变量。单次读写不可分割，不代表跨多个步骤的决策不可分割。
 
-竞态条件(race condition)是程序的执行结果依赖于多个线程的相对执行顺序的情况。临界区(critical section)是访问共享资源的代码区域。
+临界区需要保护的通常不是某一行代码，而是共享不变量(invariant)。不变量是程序在每次受保护操作前后都必须成立的关系，例如“队列元素数量介于 0 和容量之间”或“账户余额与流水总额一致”。同步协议必须覆盖从读取旧状态到恢复不变量的完整区间。
 
-回到开篇的 `counter++`。它编译成三条指令：load（读取 counter 到寄存器）、add（寄存器加一）、store（写回 counter）。两个线程交错执行时会出现这样的情况：
+经典临界区问题提出三个评价要求：
 
-| 时刻 | 线程 A | 线程 B | counter（内存） |
-|------|--------|--------|----------------|
-| 1 | load counter → 寄存器 = 0 | | 0 |
-| 2 | | load counter → 寄存器 = 0 | 0 |
-| 3 | add → 寄存器 = 1 | | 0 |
-| 4 | | add → 寄存器 = 1 | 0 |
-| 5 | store → counter = 1 | | 1 |
-| 6 | | store → counter = 1 | 1 |
+| 要求 | 含义 |
+|------|------|
+| 互斥(mutual exclusion) | 同一时刻至多一个参与者执行互斥临界区 |
+| 进展(progress) | 临界区空闲且存在请求者时，系统最终允许某个请求者进入 |
+| 有限等待(bounded waiting) | 一个请求者等待期间，其他参与者越过它的次数有上限 |
 
-两个线程各自加了一次，counter 应该是 2，实际是 1。线程 B 在时刻 2 读到的是旧值 0，基于旧值计算并写入，覆盖了线程 A 的结果。这就是丢失更新(lost update)。百万次循环中只要发生几次这样的交错，最终结果就会偏小。
+真实同步原语不一定同时承诺三项。例如，一把不公平 mutex 可以保证互斥与整体进展，却不保证每个等待线程都在有限次数内获得锁；某个线程可能发生饥饿，即系统整体仍在推进，但它长期得不到资源。选择原语时必须区分安全性“不会同时进入”和活性“等待最终会结束”。
 
-要正确保护临界区，需要满足三个要求：
+`volatile` 不能修复数据竞争。它主要约束编译器对单个对象访问的省略与合并，常用于设备寄存器等场景，不会让整次读改写变得不可分割，也不会建立线程间顺序保证。
 
-**互斥(mutual exclusion)**：同一时刻最多一个线程执行临界区代码。这是最基本的要求，如果两个线程可以同时在临界区内，竞态条件就没有被消除。
+## 原子操作与内存序
 
-**进展**：如果没有线程在临界区内，且有线程想进入，那么必须在有限时间内让某个线程进入。换句话说，不能出现"所有线程都在门口等、但谁也进不去"的情况。
+原子操作(atomic operation)是在语言内存模型中不可被其他线程观察到中间状态的操作；内存序(memory ordering)规定多个内存操作允许以什么顺序被其他线程观察。
 
-**有限等待(bounded waiting)**：一个线程请求进入临界区后，其他线程进入临界区的次数有上限。这防止某个线程被永远"插队"而饿死(starvation)。
+两者解决不同问题。原子读改写可以让两个线程对同一个计数器递增而不丢失更新；但若线程 A 先写数据再发布“ready”标志，线程 B 还需要顺序保证，才能在看到 ready 后读取到对应数据。
 
-:::thinking Peterson 算法在现代硬件上能正确工作吗？
+现代处理器提供原子读改写指令，编译器再通过 C11 `_Atomic` 和 `<stdatomic.h>` 暴露可移植接口。两种基础语义是：
 
-在硬件原子指令出现之前，有人尝试用纯软件方式解决临界区问题。Peterson 算法（1981）是最经典的方案，它只用两个共享变量就实现了两个线程之间的互斥。
+| 操作 | 语义 |
+|------|------|
+| 测试并设置(Test-and-Set) | 原子地写入占用值，并返回旧值 |
+| 比较并交换(Compare-and-Swap, CAS) | 当前值等于 `expected` 时原子替换为 `desired`，否则报告失败并返回实际值 |
 
-算法的思路是这样的：每个线程想进临界区之前，先做两件事。第一，在 `flag` 数组中声明自己的意图（"我想进去"）。第二，把 `turn` 设给对方（"你先请"）。然后检查：对方是否也想进来（`flag[对方] == 1`），并且 turn 还给着对方（`turn == 对方`）？如果两个条件都成立，说明对方也想进来且拥有优先权，那就等着。否则自己进入临界区。
+CAS 适合实现“读取旧值、计算候选新值、尝试提交”的重试循环。若其他线程在提交前修改了对象，比较失败，调用者重新读取并计算。它只保证这一次比较与替换不可分割，不会自动证明整个数据结构正确，也不会自动保证无饥饿。
+
+对于只需要精确计数、不负责发布其他数据的场景，可以使用 relaxed 原子读改写：
 
 ```c
-int flag[2] = {0, 0};  // flag[i] = 1 表示线程 i 想进入临界区
-int turn;               // 当两个线程都想进时，turn 决定谁优先
+#include <stdatomic.h>
 
-// 线程 i 的代码（i = 0 或 1）
-flag[i] = 1;            // 第一步：声明"我想进临界区"
-turn = 1 - i;           // 第二步：把优先权让给对方
-while (flag[1-i] && turn == 1-i)
-    ;                   // 对方也想进、且 turn 给着对方 → 等待
-// —— 临界区 ——
-flag[i] = 0;            // 离开：撤销意图
-```
+_Atomic unsigned long counter = 0;
 
-为什么这能保证互斥？假设线程 0 和线程 1 同时想进入临界区。两个线程都把 `flag` 设为 1，然后分别执行 `turn = 1` 和 `turn = 0`。`turn` 是一个普通整数，两次赋值有先后，最终 `turn` 只会是 0 或 1。假设 `turn` 最终是 1（线程 1 的赋值 `turn = 0` 先执行，然后被线程 0 的 `turn = 1` 覆盖了）。此时线程 0 检查 while 条件：`flag[1] == 1`（真）且 `turn == 1`（真），线程 0 等待。线程 1 检查：`flag[0] == 1`（真）但 `turn == 0`（假，因为 turn 是 1），while 条件不成立，线程 1 进入临界区。无论 turn 最终是什么值，只有一个线程能通过 while 循环。
-
-在顺序一致性(sequential consistency)内存模型下，这个算法是正确的。所谓顺序一致性，就是所有线程看到的内存操作顺序与程序代码中的顺序一致。
-
-但现代 CPU 会重排(reorder)指令来提高性能。只要重排不改变单线程的执行结果，CPU 就认为这种重排是合法的。问题是，对单线程合法的重排，对多线程可能产生灾难性的后果。
-
-具体到 Peterson 算法：`flag[i] = 1` 和 `turn = 1 - i` 是两个独立的 store 操作，CPU 可能把它们重排。如果线程 0 先执行了 `turn = 1`，但还没执行 `flag[0] = 1`，此时线程 1 检查 `flag[0]`，看到 0，认为线程 0 没有意图进入临界区，直接通过 while 循环。与此同时线程 0 也完成了 `flag[0] = 1` 并通过 while 循环（因为 `turn == 0`，不满足等待条件）。两个线程同时进入了临界区，互斥被破坏了。
-
-这不是理论上的问题。在 ARM、RISC-V 等弱内存模型(weak memory model)的架构上，store-store 重排是真实存在的。即使在 x86（TSO 模型，store-store 不重排）上，store-load 重排也可能破坏某些算法的正确性。
-
-结论是：纯软件方案在现代 CPU 上不可靠。要让多线程正确同步，必须使用硬件提供的原子指令和内存屏障。
-:::
-
-## 硬件原子操作
-
-原子操作(atomic operation)是硬件保证以不可分割的方式执行的操作，其他线程无法观察到操作的中间状态。
-
-上一节指出 Peterson 算法在现代硬件上失效，原因是 CPU 会重排内存访问。要解决这个问题，需要两样东西：阻止重排的内存屏障，和保证读-改-写不可分割的原子指令。
-
-**内存屏障(memory barrier / memory fence)** 是一条特殊指令，阻止 CPU 跨越屏障重排内存访问。屏障之前的内存操作必须在屏障之后的内存操作之前完成。Linux 内核提供了三种屏障宏：`smp_mb()`（全屏障，阻止任何方向的重排）、`smp_rmb()`（读屏障，阻止读操作重排）、`smp_wmb()`（写屏障，阻止写操作重排）。`smp` 是 SMP(Symmetric Multi-Processing，对称多处理)的缩写，表示这些屏障只在多核系统上生效；单核系统不存在跨核重排问题，这些宏会编译为空操作。不同架构的内存模型强弱不同：x86 使用 TSO(Total Store Order)模型，硬件本身就保证 store-store 和 load-load 不重排，所以 `smp_wmb()`（写屏障，阻止 store-store 重排）在 x86 上编译为空操作，因为硬件已经提供了这个保证。x86 唯一允许的重排是 store-load（先写后读可能被重排为先读后写），所以只有 `smp_mb()`（全屏障）在 x86 上需要生成真正的屏障指令。ARM 和 RISC-V 使用更弱的内存模型，store-store、load-load 都可能重排，所有屏障宏都会生成实际指令，开销也更大。
-
-有了内存屏障可以阻止重排，但还不够。`counter++` 的问题不是重排，而是 load-add-store 三步不是一个整体，中间可以被打断。需要硬件把这三步合并成一条不可分割的指令。
-
-现代 CPU 提供了多种这样的原子指令，其中最基础的两种是 Test-and-Set 和 Compare-and-Swap。它们的共同特点是把"读取旧值 + 写入新值"合并成一条硬件指令，其他核心无法在中间插入操作。我们先看较简单的 TAS，再看更通用的 CAS。
-
-**Test-and-Set(TAS)** 是最简单的一种。假设我们用一个整数变量 `lock` 表示锁的状态，0 表示空闲，1 表示占用。TAS 对这个变量做一件事：原子地读出 `lock` 的当前值，同时把 `lock` 设为 1。下面的伪代码展示了 TAS 的语义，硬件保证这三行作为一个整体执行，中间不会被打断：
-
-```c
-// 硬件保证以下操作不可分割
-int test_and_set(int *lock) {
-    int old = *lock;  // 读出当前值
-    *lock = 1;        // 无条件设为 1
-    return old;       // 返回之前的值
+void increment(void)
+{
+    atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
 }
 ```
 
-如果 `lock` 之前是 0（空闲），TAS 返回 0，同时已经把 `lock` 设为 1（占用），加锁完成。如果 `lock` 之前是 1（已被占用），TAS 返回 1，`lock` 仍然是 1（设 1 为 1，没有变化），加锁失败。整个过程只有一条指令，不存在 load-add-store 之间被打断的窗口。用 TAS 可以构建最朴素的自旋锁：
+`memory_order_relaxed` 保证 `counter` 更新本身原子，但不约束它与其他对象访问的先后关系。若一个线程要发布已经初始化的数据，常见协议是发布方使用释放(release)操作写入状态，读取方使用获取(acquire)操作观察状态。当 acquire 读取到 release 发布的状态值时，release 之前的操作与 acquire 之后的操作建立先行发生关系(happens-before)：语言保证前一方的效果按规定顺序对后一方可见。
 
-```c
-void spin_lock(int *lock) {
-    while (test_and_set(lock) == 1)
-        ;  // 锁被占用，反复尝试
-}
+锁通常把这套关系封装起来：成功加锁具有 acquire 语义，解锁具有 release 语义。持锁线程在解锁前写入的数据，对随后成功获取同一把锁的线程可见。顺序一致性(sequential consistency)则提供更强的全局单序模型，推理更直接，但可能限制部分优化。
 
-void spin_unlock(int *lock) {
-    *lock = 0;
-}
-```
+内存屏障(memory barrier/fence)是约束屏障两侧内存操作顺序的低层机制。屏障不是锁，也不会把 `counter++` 变成原子操作；它只建立指定方向的排序。Linux 内核用 `smp_mb()`、`smp_rmb()`、`smp_wmb()` 等架构无关接口表达全屏障、读屏障和写屏障，具体指令由目标架构的内存模型决定。屏障表达的是可观察顺序，不应简单理解成“前面的数据已经全部写回主存”。
 
-但 TAS 只能把值设为 1，不够灵活。
+应用代码应优先使用 C 原子类型、Pthreads 锁和条件变量，让编译器同时处理指令选择与编译期重排。直接拼硬件指令或只插入 CPU fence，容易遗漏语言内存模型对编译器的约束。
 
-**Compare-and-Swap(CAS)** 更强大：原子地比较一个内存位置的当前值与期望值，如果相等就替换为新值，返回操作是否成功。x86 上对应的指令是 `CMPXCHG`。
+## 锁
 
-```c
-// 硬件保证以下操作不可分割
-bool compare_and_swap(int *addr, int expected, int new_val) {
-    if (*addr == expected) {
-        *addr = new_val;
-        return true;
-    }
-    return false;
-}
-```
+锁(lock)是让执行流按照所有权或访问模式互斥进入临界区的同步原语。
 
-CAS 比 TAS 更通用。TAS 只能设为固定值，CAS 可以基于当前值计算新值。比如用 CAS 实现原子的 `counter++`：反复读取当前值，尝试用 CAS 把它替换为当前值加一。如果在你读取和替换之间有其他线程修改了 counter，CAS 会失败，你重新读取再试。这种"读-计算-CAS"的循环叫做 CAS 循环(CAS loop)，是无锁(lock-free)编程的基础模式。
+自旋锁(spinlock)在锁不可用时反复检查状态，不主动阻塞当前线程。它避免了睡眠与唤醒，但等待期间持续占用 CPU，并会产生对锁缓存行的一致性流量。自旋适合持锁时间很短、持有者能够继续运行且当前上下文不能睡眠的场景；若持有者被抢占或临界区执行阻塞 I/O，等待者可能长期浪费处理器时间。
 
-Linux 内核用 `atomic_t` 类型和一组原子操作函数封装了这些硬件指令。`atomic_t` 是一个包含单个整数的结构体，内核提供 `atomic_cmpxchg()`（CAS）、`atomic_inc()`（原子加一）、`atomic_set()`（原子赋值）、`atomic_exchange()`（原子交换）等函数来操作它：
+互斥锁是具有持有者语义的互斥原语，竞争路径可以把等待线程阻塞，锁释放后再唤醒。用户态 `pthread_mutex_t` 通常先用原子操作尝试无竞争快速路径，只有竞争时才进入内核等待；具体实现还可能短暂自旋，但“mutex 必然立刻睡眠”并不是接口保证。
 
-```c
-// include/linux/types.h
-typedef struct {
-    int counter;
-} atomic_t;
+| 特征 | 自旋锁 | mutex |
+|------|--------|-------|
+| 等待方式 | 活跃轮询 | 可以阻塞，并由内核唤醒 |
+| 等待时 CPU | 持续消耗执行时间 | 可调度给其他任务 |
+| 适合的临界区 | 很短且不能睡眠 | 持有时间不确定或允许睡眠 |
+| 主要风险 | 持有者未运行时无效自旋 | 睡眠、唤醒和调度开销 |
 
-// include/linux/atomic/atomic-instrumented.h (simplified)
-// 内核对外 API：调用 arch_ 前缀的架构实现
-static inline int atomic_cmpxchg(atomic_t *v, int old, int new) {
-    return arch_atomic_cmpxchg(v, old, new);
-}
+不能用固定的微秒阈值决定选择。临界区时间分布、CPU 是否超额订阅、持有者是否可能被抢占、核心间拓扑和竞争程度都会改变结果。Linux 内核 mutex 的乐观自旋(optimistic spinning)会在合适条件下先等待正在运行的持有者，说明实际实现可以组合自旋与睡眠，而不是二选一。
 
-// arch/x86/include/asm/atomic.h (simplified)
-// x86 架构实现：编译为 CMPXCHG 指令
-static inline int arch_atomic_cmpxchg(atomic_t *v, int old, int new) {
-    return arch_cmpxchg(&v->counter, old, new);
-}
+锁的状态也需要正确的内存序。一个最小自旋锁可用原子 exchange 获取所有权，并在解锁时执行 release store；只把普通整数从 0 改成 1，即使操作看似不可中断，也可能缺少编译器和 CPU 所需的 acquire/release 约束。
 
-// x86 架构实现：lock 前缀 + incl 指令
-static inline void arch_atomic_inc(atomic_t *v) {
-    asm volatile("lock incl %0" : "+m" (v->counter));
-}
-```
+读写锁(reader-writer lock)允许多个读者同时持有读锁，但写者必须独占。它适合读临界区明显占多数、持锁时间足以抵消管理开销的场景。读者计数、所有权转换和公平策略使它比普通 mutex 更复杂；持续到来的读者可能让写者饥饿，写者优先策略又可能延迟读者，因此接口或实现必须明确公平性取舍。
 
-`atomic_cmpxchg()` 是内核对外的 API，它调用 `arch_atomic_cmpxchg()`，各架构在自己的 `arch/*/include/asm/atomic.h` 中提供实现。编译时根据目标架构选择对应的头文件，`atomic_cmpxchg()` 就被内联展开为该架构的原子指令。`lock` 前缀是 x86 特有的机制，它锁住内存总线（现代 CPU 是锁缓存行），保证后面的指令原子执行。`lock incl` 把 load-add-store 合成了一条不可分割的操作，直接解决了开篇 `counter++` 的问题。
+无论使用哪种锁，都应尽量缩短持锁范围，并在获取多把锁时规定一致顺序。[死锁](/concurrency/03-deadlock)会分析锁顺序为什么影响系统能否继续推进。
 
+## 条件等待
 
-## 自旋锁与互斥锁
+条件等待是线程在共享状态暂不满足要求时释放处理器，并在状态可能变化后重新检查的同步方式。
 
-自旋锁(spinlock)是等待线程反复检查锁变量直到可用的锁。互斥锁(mutex)是等待线程被操作系统挂起、锁可用时被唤醒的锁。
+信号量(semaphore)维护可用许可数量。`sem_wait()` 在计数大于 0 时取得一个许可并减一，否则阻塞；`sem_post()` 增加许可并可能唤醒等待者。初始值为 $N$ 的信号量可以限制同时使用某类资源的线程数，例如大小为 10 的连接池最多发放 10 个许可。
 
-自旋锁的实现直接基于上一节的原子操作。Linux 内核的 `spin_lock` 简化逻辑如下：
+二元信号量只有 0 和 1 两种许可数量，表面上接近 mutex，但语义不同。mutex 具有所有者，通常要求加锁线程解锁；信号量表示可传递许可，一个执行流可以 post 由另一个执行流 wait 的许可。需要保护共享不变量时优先使用 mutex，需要计数或跨执行流通知时才考虑 semaphore。
 
-```c
-// include/asm-generic/spinlock.h (simplified)
-typedef struct {
-    atomic_t lock;  // 0 = unlocked, 1 = locked
-} spinlock_t;
+条件变量(condition variable)让线程等待某个由共享数据表示的谓词(predicate)可能变为真。谓词是可判断真假的状态表达式，例如 `count > 0`；条件变量本身不保存“缓冲区非空”这个状态，也不是会永久积累的事件计数器。
 
-static inline void spin_lock(spinlock_t *s) {
-    while (atomic_cmpxchg(&s->lock, 0, 1) != 0)
-        cpu_relax();  // 暂停指令，降低功耗和总线压力
-}
-
-static inline void spin_unlock(spinlock_t *s) {
-    atomic_set(&s->lock, 0);
-}
-```
-
-`cpu_relax()` 在 x86 上编译为 `PAUSE` 指令，它告诉 CPU"当前在自旋等待"，CPU 会降低功耗并减少对内存总线的争用。没有这条指令，自旋锁的忙等会产生大量无用的缓存一致性流量。
-
-自旋锁的优势是没有上下文切换的开销。线程拿不到锁就原地循环，一旦锁释放就能立刻获取，响应延迟低。这在内核中尤为重要：内核的很多临界区非常短（几条指令），进入睡眠再被唤醒的上下文切换开销远大于自旋几次的开销。而且内核中有些上下文（比如中断处理程序）根本不允许睡眠，只能用自旋锁。
-
-但自旋锁有一个根本问题：忙等。线程拿不到锁时占着 CPU 空转，这段 CPU 时间完全浪费了。如果临界区很长（比如涉及磁盘 I/O），等待者可能自旋整个时间片。用户态线程是可被抢占的，假设线程 A 持有自旋锁后被调度器抢占，线程 B 尝试获取锁，它会自旋整个时间片都拿不到锁（因为线程 A 被挂起了，无法释放锁）。这种浪费在用户态是不可接受的。
-
-长临界区需要一种不同的策略：拿不到锁就去睡觉，等锁的持有者释放时再把你叫醒。这就是互斥锁(mutex)。
-
-互斥锁由两部分组成：一个锁变量和一个等待队列。加锁时检查锁变量，如果锁空闲就获取，如果锁被占用就把当前线程加入等待队列并让它睡眠。解锁时释放锁变量，从等待队列中取出一个等待者并唤醒它。
-
-这里需要先区分两个东西：**内核 mutex** 和**用户态 mutex**。内核有自己的互斥锁实现（`struct mutex`，定义在 `kernel/locking/mutex.c`），供内核代码内部使用。驱动程序、文件系统、内核子系统之间需要同步时，调用 `mutex_lock()`/`mutex_unlock()`，整个加锁解锁过程都发生在内核空间。用户程序不会直接调用它。用户程序用的是 `pthread_mutex_lock()`，这是 glibc 提供的用户态实现，底层基于 futex（后面会讲）。两者的原理相同（CAS 快速路径 + 睡眠慢速路径），但实现完全不同。
-
-我们先看内核 mutex 的实现来理解原理，然后再看用户态 mutex 面临的额外困难。
-
-```c
-// kernel/locking/mutex.c (simplified)
-struct mutex {
-    atomic_t        owner;      // 锁的持有者
-    struct list_head wait_list;  // 等待队列
-};
-
-void mutex_lock(struct mutex *lock) {
-    if (atomic_cmpxchg(&lock->owner, 0, current) == 0)
-        return;  // 快速路径：锁空闲，直接获取
-    // 慢速路径：加入等待队列，睡眠
-    list_add_tail(&waiter.list, &lock->wait_list);
-    schedule();  // 让出 CPU
-}
-
-void mutex_unlock(struct mutex *lock) {
-    atomic_set(&lock->owner, 0);
-    if (!list_empty(&lock->wait_list)) {
-        waiter = list_first_entry(&lock->wait_list, ...);
-        wake_up_process(waiter->task);
-    }
-}
-```
-
-但这段简化代码有一个致命的问题：`mutex_lock` 中先检查锁状态（`atomic_cmpxchg` 返回非零），然后加入等待队列并睡眠（`schedule()`）。在这两步之间，锁的持有者可能已经释放了锁并调用了 `wake_up_process()`。但此时你还没有加入等待队列，唤醒信号发给了空队列，被丢弃了。等你加入等待队列并调用 `schedule()` 后，再也没有人来唤醒你了。这就是丢失唤醒(lost wakeup)问题。
-
-丢失唤醒的根因是"检查锁状态"和"加入等待队列并睡眠"这两步不是原子的。中间有窗口，唤醒信号可以从这个窗口中溜走。解决方案必须保证 check-and-sleep 的原子性。内核 mutex 的真正实现比上面的简化版复杂，它用 spinlock 保护了"检查状态 + 加入等待队列 + 设置线程状态"这一整段操作，在持有 spinlock 的情况下完成入队，释放 spinlock 之后才调用 `schedule()` 让出 CPU。因为 `mutex_unlock` 端也要先获取同一把 spinlock 才能唤醒等待者，所以 check-and-sleep 与 wake 被序列化了，不会丢失唤醒。
-
-内核 mutex 能这样做，是因为 `mutex_lock()` 本身就运行在内核空间，可以直接操作内核的 spinlock、等待队列和调度器。但用户态的 `pthread_mutex_lock()` 没有这些条件：用户态代码无法直接操作内核的等待队列，也无法在用户态获取内核的 spinlock。用户态做了 CAS（check）之后，如果需要睡眠，就必须通过系统调用进入内核。在这次系统调用的边界上，同样存在丢失唤醒的窗口。Futex 正是为解决这个跨边界的 check-and-sleep 原子性问题而设计的。
-
-:::thinking 自旋还是睡眠？
-
-自旋锁不让出 CPU，互斥锁让出 CPU 但有上下文切换的开销。选哪个取决于临界区耗时 $T_{cs}$ 和上下文切换开销 $T_{ctx}$ 的关系。
-
-如果 $T_{cs} < T_{ctx}$，自旋比切换更快。线程原地等几个时钟周期就能拿到锁，比切换到另一个线程再切换回来划算。
-
-如果 $T_{cs} > T_{ctx}$，睡眠比自旋更高效。自旋浪费的 CPU 时间可以让给其他线程干有用的工作。
-
-在现代 x86 CPU 上，一次完整的上下文切换大约需要几微秒（包括保存/恢复寄存器、刷新流水线、可能的 TLB 失效）。所以如果临界区在几微秒内就能完成，自旋更划算；如果临界区可能持续数十微秒或更长，应该用互斥锁。
-
-实际上，Linux 内核的 mutex 实现了一种混合策略叫做 optimistic spinning（乐观自旋）：如果锁的持有者正在 CPU 上运行（还没有被调度器切走），等待者就不进入睡眠，而是自旋等待。理由是：锁的持有者正在 CPU 上执行，很可能马上就会释放锁。进入睡眠再被唤醒的开销比自旋几圈更大。只有当持有者也被调度走了（不在任何 CPU 上运行），等待者才放弃自旋，进入睡眠。
-
-```c
-// kernel/locking/mutex.c — optimistic spinning
-if (mutex_optimistic_spin(lock, ...)) {
-    // 持有者正在运行，自旋等到锁释放
-    return;
-}
-// 持有者不在 CPU 上，进入慢速路径：睡眠
-```
-
-这种策略在实践中非常有效：大多数 mutex 的持有时间很短，持有者大概率还在 CPU 上，等待者自旋几圈就能拿到锁，避免了不必要的上下文切换。
-:::
-
-## 信号量与条件变量
-
-信号量(semaphore)是维护一个整数计数器的同步原语，支持 wait（计数器减一，为零则阻塞）和 signal（计数器加一，唤醒一个阻塞者）操作。条件变量(condition variable)是让线程等待特定条件成立的同步原语，与互斥锁配合使用。
-
-互斥锁解决了互斥问题，但有些场景需要的不止是互斥。信号量是 Dijkstra 在 1965 年提出的，他定义了两个操作：P(proberen，荷兰语"尝试")和 V(verhogen，"增加")。
-
-```c
-// kernel/locking/semaphore.c (simplified)
-struct semaphore {
-    unsigned int    count;       // 计数器
-    struct list_head wait_list;  // 等待队列
-};
-
-// P 操作（wait / down）
-void down(struct semaphore *sem) {
-    if (sem->count > 0) {
-        sem->count--;       // 有资源，获取
-    } else {
-        // 加入等待队列，睡眠
-        list_add_tail(&waiter.list, &sem->wait_list);
-        schedule();
-    }
-}
-
-// V 操作（signal / up）
-void up(struct semaphore *sem) {
-    if (list_empty(&sem->wait_list)) {
-        sem->count++;       // 没有等待者，增加计数
-    } else {
-        waiter = list_first_entry(&sem->wait_list, ...);
-        wake_up_process(waiter->task);  // 有等待者，唤醒一个
-    }
-}
-```
-
-当计数器初始值为 1 时，信号量退化为二元信号量(binary semaphore)，行为类似互斥锁：一次只有一个线程能通过 `down()`。当初始值为 N 时，最多允许 N 个线程同时通过，适用于有限资源池（比如数据库连接池限制最多 10 个并发连接）。
-
-现代 Linux 内核更偏向使用 mutex 而非信号量。原因是 mutex 有所有权(ownership)的概念：谁加的锁谁来解。内核可以基于所有权实现优先级继承(priority inheritance)：如果高优先级线程在等一个低优先级线程持有的 mutex，内核临时提升低优先级线程的优先级，让它尽快完成临界区并释放锁。信号量没有所有权约束（一个线程 `down()`，另一个线程可以 `up()`），无法做优先级继承。
-
-互斥锁和信号量都是等锁：资源被占就等，资源释放就获取。但有些场景需要等的不是锁本身，而是某个条件成立。
-
-想象生产者-消费者场景：生产者往有界缓冲区写数据，消费者从缓冲区读数据。消费者获取了保护缓冲区的 mutex，发现缓冲区是空的。接下来怎么办？如果持锁自旋等待，生产者也需要这把 mutex 才能写入数据，消费者持锁自旋就阻塞了生产者，形成死锁。消费者必须释放 mutex，让生产者能够写入，然后等缓冲区非空时再去获取 mutex 重新检查。
-
-这正是条件变量(condition variable)做的事情。`pthread_cond_wait()` 的语义是：原子地释放关联的 mutex 并让当前线程进入阻塞，直到被其他线程调用 `pthread_cond_signal()` 唤醒。唤醒后自动重新获取 mutex，然后从 `pthread_cond_wait()` 返回。"原子地释放并阻塞"是关键：如果释放和阻塞不是原子的，中间就可能丢失唤醒信号（和 mutex 的 check-and-sleep 问题一样）。
-
-条件变量有一个重要的细节：`pthread_cond_wait()` 可能在没有人调用 `signal()` 的情况下返回，这叫做虚假唤醒(spurious wakeup)。原因有多种：底层实现可能使用 futex，内核唤醒可能误中；某些架构的内存模型允许这种行为。所以 `pthread_cond_wait()` 必须在 while 循环中调用，不能用 if：
+消费者等待有界缓冲区非空时，需要先持有保护 `count` 的 mutex，再在循环中检查谓词：
 
 ```c
 pthread_mutex_lock(&mutex);
-while (buffer_empty)                   // 用 while，不用 if
-    pthread_cond_wait(&cond, &mutex);  // 可能虚假唤醒，所以回到 while 重新检查
-// 此时 buffer 非空，且持有 mutex
-consume(buffer);
+
+while (count == 0)
+    pthread_cond_wait(&not_empty, &mutex);
+
+item = remove_item();
+pthread_cond_signal(&not_full);
 pthread_mutex_unlock(&mutex);
 ```
 
-如果用 if 而不是 while，虚假唤醒后线程不会重新检查条件，直接执行 `consume(buffer)`，此时缓冲区可能仍然是空的。
+`pthread_cond_wait()` 在阻塞当前线程的同时原子地释放 mutex；返回前又重新获取 mutex。这里的“原子”针对等待者注册与 mutex 释放之间的关系：生产者不可能恰好在消费者释放锁但尚未成为等待者时发出一个导致消费者永久睡眠的通知。这避免了丢失唤醒(lost wakeup)。
 
-:::expand 读写锁(Reader-Writer Lock)
+wait 必须放在 `while` 而不是 `if` 中。POSIX 允许虚假唤醒(spurious wakeup)；即使唤醒对应真实通知，另一个消费者也可能先获得 mutex 并取走数据。通知的含义只是“状态可能变化，请重新检查”，只有受 mutex 保护的谓词才是是否继续执行的依据。
 
-互斥锁的策略是"一次只有一个线程"。但有些共享数据被频繁读取、偶尔修改。如果用互斥锁保护，多个读者之间也会互斥，而读者之间实际上不需要互斥，因为读操作不修改数据。
-
-读写锁(reader-writer lock, rwlock)放宽了限制：允许多个读者同时持有锁，但写者必须独占。两条规则：如果有线程在读，其他线程可以读但不能写；如果有线程在写，其他线程既不能读也不能写。
-
-```c
-// include/linux/rwlock_types.h (simplified)
-typedef struct {
-    atomic_t reader_count;  // 当前读者数量
-    spinlock_t write_lock;  // 写者独占锁
-} rwlock_t;
-```
-
-读写锁的一个经典问题是写者饥饿(writer starvation)：如果不断有新的读者到来，写者可能永远等不到所有读者离开。解决方案之一是写者优先(writer-preference)：当写者在等待时，不再允许新的读者进入，只等现有读者离开。但这又可能导致读者饥饿。在实际系统中往往需要在读者优先和写者优先之间权衡。
-:::
+生产者应在持有同一 mutex 时修改 `count`，使谓词检查与状态更新形成一致顺序，然后调用 `pthread_cond_signal()` 唤醒至少一个候选等待者，或用 `pthread_cond_broadcast()` 唤醒所有等待者。若 signal 发生时无人等待，条件变量不会替未来线程保存通知；未来线程仍通过谓词判断是否需要等待。
 
 ## Futex
 
-Futex(Fast Userspace Mutex)是 Linux 提供的系统调用，它的核心能力是：让用户态线程可以在一个用户态内存地址上原子地等待和唤醒。
+快速用户空间互斥机制(fast userspace mutex, futex)是 Linux 让线程按一个 32 位用户空间值进行条件阻塞和唤醒的内核接口。
 
-注意 futex 不是锁，不是互斥锁，也不是任何一种同步原语。它是一个通用的底层机制，只做两件事：
+futex 不是完整的 mutex，也不规定共享整数中每一位的含义。线程库先在用户态用原子操作修改状态；只有需要阻塞或唤醒时才执行 futex 系统调用。无竞争加锁与解锁因而可以完全留在用户态，这就是名称中 fast 的来源。
 
-- **按地址等待**：如果某个用户态地址上的值等于期望值，就让当前线程睡眠
-- **按地址唤醒**：唤醒在某个用户态地址上等待的线程
+两个基础操作是：
 
-glibc 的 `pthread_mutex_lock()`、`pthread_cond_wait()`、`sem_wait()`、`pthread_rwlock_rdlock()` 在底层全部基于 futex 实现。futex 是用户态同步原语的**共同基础设施**，而不是其中的一种。
+| 操作 | 内核语义 |
+|------|----------|
+| `FUTEX_WAIT` | 仅当 `*uaddr` 仍等于 expected 时，把调用线程加入该 futex 的等待集合并阻塞；不相等时返回 `EAGAIN` |
+| `FUTEX_WAKE` | 唤醒在 `uaddr` 上等待的至多 $N$ 个线程，并返回实际唤醒数量 |
 
-那为什么用户态同步原语需要 futex？前面互斥锁一节讲到，内核 mutex 用 spinlock 保护 check-and-sleep，解决了丢失唤醒。但用户态代码无法直接操作内核的 spinlock 和等待队列，从"用户态 CAS 失败"到"进入内核睡眠"之间跨越了系统调用边界，存在丢失唤醒的窗口。不只是互斥锁有这个问题。条件变量的 `pthread_cond_wait()` 需要"检查条件 + 释放 mutex + 睡眠"原子完成；信号量的 `sem_wait()` 需要"检查计数器 + 睡眠"原子完成。**任何**用户态同步原语，只要涉及"检查某个条件，不满足就睡眠"，都面临同样的跨边界原子性问题。Futex 就是 Linux 为这一类问题提供的统一解决方案。
+`FUTEX_WAIT` 的“比较并阻塞”相对于同一 futex 上的并发操作是原子的。假设用户态 CAS 发现 mutex 已占用，随后锁在进入内核前被释放：内核重新读取 futex word 时会发现它不再等于 expected，直接返回而不睡眠。若值仍相等，内核先把等待关系登记到受锁保护的队列，再真正调度出去；解锁方的 wake 不能越过这一步而永久丢失。
 
-Futex 的解法很巧妙：既然用户态的检查和内核的睡眠之间有窗口，那就让内核**进来之后再检查一次**。`futex()` 系统调用的签名是 `futex(int *addr, int op, int val, ...)`，第一个参数是用户态变量的地址，第二个参数是操作类型。关键的操作有两个：
+```text
+用户态快速路径                     内核竞争路径
 
-- `futex(addr, FUTEX_WAIT, expected_val, ...)`：进入内核后，**再次检查 `*addr` 是否仍等于 `expected_val`**。如果是，说明条件没有变化，把当前线程加入等待队列并睡眠。如果不是（说明在进内核之前条件已经改变了），立即返回，不睡眠。
-- `futex(addr, FUTEX_WAKE, n, ...)`：唤醒在该地址上等待的 n 个线程。
-
-这里的 `addr` 和 `*addr` 到底是什么？用互斥锁举一个具体的例子。用户程序声明了一个 `pthread_mutex_t my_mutex`，glibc 内部把它表示为一个结构体，其中有一个整数字段记录锁状态，这个整数有三个取值：0 表示无锁，1 表示有锁但没有等待者，2 表示有锁且有等待者。`addr` 就是这个整数字段在内存中的地址，`*addr` 就是这个整数的当前值。
-
-```
-用户程序                   内存布局
-                           地址 0x7fff1000
-pthread_mutex_t my_mutex → ┌──────────────┐
-                           │ lock_state: 2│ ← *addr = 2（有锁，有等待者）
-                           │ ...          │
-                           └──────────────┘
-                                 ↑
-                           addr = 0x7fff1000
+atomic try-lock 成功 ────────────→ 返回
+atomic try-lock 失败 ────────────→ FUTEX_WAIT(uaddr, expected)
+atomic unlock，无等待者 ─────────→ 返回
+atomic unlock，可能有等待者 ─────→ FUTEX_WAKE(uaddr, 1)
 ```
 
-当线程 A 调用 `pthread_mutex_lock(&my_mutex)` 时，glibc 先在用户态对 `addr`（即 `0x7fff1000`）做 CAS，尝试把 `*addr` 从 0 改为 1。如果 `*addr` 已经是 2（被占用），CAS 失败，glibc 调用 `futex(0x7fff1000, FUTEX_WAIT, 2, ...)`。内核收到后，去读 `0x7fff1000` 这个地址上的整数值。如果还是 2，说明锁确实还被占用，线程 A 进入睡眠。这里的"检查值"和"加入等待队列"是原子的（后面会讲内核怎么保证），不可能出现"检查时是 2，但加入队列之前其他线程把值改成了 0 并发起唤醒"的情况，所以不会丢失唤醒。如果不是 2（比如变成了 0，说明锁在用户态 CAS 失败到进入内核这段时间里已经被释放了），内核立即返回，线程 A 回到用户态重试 CAS。
+`FUTEX_WAKE` 不负责修改用户空间状态，wait 返回也不代表调用者已经获得高层锁。被唤醒线程必须回到用户态重试原子操作；wait 还可能因信号、超时或虚假唤醒返回，所以所有高层协议都需要循环检查自己的状态。
 
-所以 futex 并不关心 `addr` 上存的是"锁状态"还是"信号量计数器"还是"条件变量的序列号"。它只做一件事：**读一个用户态地址上的整数值，跟你给的期望值比较，相等就睡眠，不等就返回**。至于这个整数代表什么含义，由上层的同步原语自己定义。
+内核根据 futex key 把等待者组织进哈希桶，并用桶锁协调值检查、入队和唤醒。进程私有 futex 的 key 关联虚拟地址与地址空间；放在共享映射中的进程间共享(process-shared)futex 则需要根据共享后备对象建立跨进程一致的 key。桶数量和内部结构属于实现细节，不是用户态 ABI。
 
-glibc 把这两个操作封装成了更简洁的函数，下面的代码中会用到：
-
-- `futex_wait(addr, expected_val)` → `futex(addr, FUTEX_WAIT, expected_val, ...)`
-- `futex_wake(addr, n)` → `futex(addr, FUTEX_WAKE, n, ...)`
-
-下面以用户态互斥锁为例，看 futex 是如何被使用的。有了 futex，用户态 mutex 可以安全地拆成快慢两条路径：
-
-**快速路径（无竞争）**：用户态做一次 CAS。如果锁空闲（值为 0），CAS 成功把它设为 1，加锁完成，不进内核。解锁同理：CAS 把值从 1 改回 0，没有等待者，解锁完成。整个过程只需一条原子指令，和内核 mutex 的 CAS 快速路径本质相同。
-
-**慢速路径（有竞争）**：CAS 失败，调用 `futex_wait(addr, expected_val)` 进入内核。内核重新检查值，如果锁仍被占用就睡眠，否则立即返回。丢失唤醒不会发生。
-
-那么 `FUTEX_WAIT` 在内核中具体是怎么保证"重新检查 + 入队 + 睡眠"这一整段操作的原子性的？
-
-答案不是靠硬件原子指令，而是靠内核中的 spinlock。内核为 futex 维护了一张全局哈希表(futex hash table)，数据结构如下：
-
-```c
-// kernel/futex/futex.h (simplified)
-struct futex_hash_bucket {
-    spinlock_t       lock;       // 保护这个桶的自旋锁
-    struct list_head chain;      // 等待队列：挂着所有在这个桶上等待的线程
-};
-
-// 全局哈希表，共 256 个桶（2^8）
-static struct futex_hash_bucket futex_queues[256];
-```
-
-哈希表的作用是把用户态锁变量的地址映射到一个桶。当用户态调用 `futex_wait(addr, 2)` 时，内核对 `addr` 做哈希运算，找到对应的桶。同一个 `addr` 永远落在同一个桶里，所以同一把用户态锁上的所有 wait 和 wake 操作都竞争同一个 `bucket->lock`。
-
-```
-用户态                              内核
-                                    futex_hash_bucket[256]
-pthread_mutex_t lock_a  ──hash──→  [bucket 42] { spinlock, wait_list }
-pthread_mutex_t lock_b  ──hash──→  [bucket 17] { spinlock, wait_list }
-pthread_mutex_t lock_c  ──hash──→  [bucket 42] { spinlock, wait_list }
-                                    (lock_a 和 lock_c 碰巧落在同一个桶)
-```
-
-有了这个数据结构，再来看 `FUTEX_WAIT` 和 `FUTEX_WAKE` 的实现：
-
-```c
-// kernel/futex/core.c (simplified)
-// FUTEX_WAIT：检查值 + 加入等待队列
-int futex_wait(int *addr, int expected_val) {
-    bucket = hash(addr);               // 根据地址找到哈希桶
-    spin_lock(&bucket->lock);          // 获取桶的 spinlock
-    if (*addr != expected_val) {       // 持有 spinlock 时检查值
-        spin_unlock(&bucket->lock);
-        return -EAGAIN;                // 值已变，不睡眠
-    }
-    list_add(&current->wait_entry, &bucket->wait_list);  // 加入等待队列
-    spin_unlock(&bucket->lock);
-    schedule();                        // 让出 CPU，进入睡眠
-    return 0;
-}
-
-// FUTEX_WAKE：从等待队列中唤醒
-int futex_wake(int *addr, int n) {
-    bucket = hash(addr);               // 同一个地址 → 同一个桶
-    spin_lock(&bucket->lock);          // 获取同一把 spinlock
-    // 从 wait_list 中取出最多 n 个等待者并唤醒
-    list_for_each(waiter, &bucket->wait_list, n)
-        wake_up_process(waiter->task);
-    spin_unlock(&bucket->lock);
-    return n;
-}
-```
-
-关键在于 `FUTEX_WAIT` 的"检查值"和"加入等待队列"这两步都在 `bucket->lock` 的保护下完成。`FUTEX_WAKE` 也要先获取同一把 `bucket->lock` 才能唤醒等待者。所以只有两种可能的执行顺序：
-
-1. **wait 先拿到 spinlock**：检查值仍然等于 `expected_val`，线程加入等待队列，释放 spinlock。之后 wake 拿到 spinlock，从队列中找到这个线程并唤醒。唤醒没有丢失。
-2. **wake 先拿到 spinlock**：wake 遍历等待队列，此时等待者还没入队，队列为空，唤醒是空操作，释放 spinlock。之后 wait 拿到 spinlock，检查值，发现 `*addr` 已经被释放锁的线程改过了（不等于 `expected_val`），返回 `EAGAIN`，不睡眠。线程回到用户态重新尝试 CAS，这次成功获取锁。
-
-无论哪种顺序，线程都不会陷入"永远睡眠"的状态。这就是 futex 解决丢失唤醒的机制：不是用硬件把 check-and-sleep 变成一条不可分割的指令，而是用 spinlock 把 wait 端和 wake 端序列化，保证检查和入队在逻辑上不可被唤醒操作插入。
-
-glibc 的 `pthread_mutex_lock()` 正是基于 futex 实现的。来看 `nptl/lowlevellock.h` 中的实现是如何把快速路径和慢速路径组合在一起的：
-
-```c
-// glibc — nptl/lowlevellock.h (simplified)
-// 锁状态: 0 = unlocked, 1 = locked (no waiters), 2 = locked (has waiters)
-void lll_lock(int *futex) {
-    if (atomic_cmpxchg(futex, 0, 1) == 0)
-        return;  // 快速路径：无竞争，一条 CAS 搞定
-
-    // 慢速路径：有竞争
-    while (atomic_exchange(futex, 2) != 0)      // 设为 2 表示有等待者
-        futex_wait(futex, 2);                    // 进内核睡眠
-}
-
-void lll_unlock(int *futex) {
-    if (atomic_exchange(futex, 0) == 2)          // 之前状态是 2，说明有等待者
-        futex_wake(futex, 1);                    // 进内核唤醒一个
-}
-```
-
-注意代码中的参数名 `int *futex` 就是前面一直讨论的 `addr`——用户态锁变量那个整数的内存地址。名字碰巧和 `futex()` 系统调用相同，容易混淆，但它只是一个普通的整数指针。对照代码可以看到，`*addr` 值的每一次修改都是用户态代码通过原子操作完成的：`atomic_cmpxchg(futex, 0, 1)` 把 0 改为 1（加锁），`atomic_exchange(futex, 2)` 设为 2（标记有等待者），`atomic_exchange(futex, 0)` 设为 0（解锁）。`futex_wait()` 和 `futex_wake()` 不修改这个值，它们只负责"读值、比较、决定睡眠或返回"和"唤醒等待者"。
-
-锁有三个状态：0（无锁）、1（有锁无等待者）、2（有锁且有等待者）。解锁时只有旧值为 2 才需要进内核唤醒等待者。旧值为 1 时解锁也不需要系统调用。这样在无竞争和低竞争的场景下，加锁和解锁都在用户态完成，性能接近一条原子指令。
-
-这就是 futex 名字里"Fast"的含义：无竞争时不进内核（快），有竞争时进内核但不会丢失唤醒（正确）。
-
-这里只展示了互斥锁的实现，但 futex 的作用远不止于此。glibc 中几乎所有的 pthread 同步原语都建立在 futex 之上：`pthread_cond_wait()` 用 futex 实现"释放 mutex + 睡眠"的原子操作；`sem_wait()` 用 futex 实现"检查计数器 + 睡眠"的原子操作；`pthread_rwlock_rdlock()` 用 futex 实现"检查写者状态 + 睡眠"的原子操作。模式是相同的：用户态先检查共享变量，如果需要等待就调用 `futex_wait()` 进内核，内核重新检查后决定是否睡眠。Futex 是用户态同步的基础设施层，各种同步原语是建立在它之上的应用层。
+glibc 的普通 Pthreads mutex、条件变量、信号量和线程 join 都可以利用 futex，但每种原语在 futex word 中编码的状态不同。把某一版 glibc mutex 的 0/1/2 布局当成 futex 接口规范，会混淆库实现与内核 ABI。
 
 ## 经典同步问题
 
-经典同步问题是对并发编程中反复出现的模式的抽象，既是教学工具也是设计模板。
+经典同步问题是把互斥、条件等待、资源计数和锁顺序组合成可重复分析的并发模式。
 
-**生产者-消费者(Producer-Consumer)**。一个有界缓冲区，生产者往里面放数据，消费者从里面取数据。缓冲区满时生产者等待，缓冲区空时消费者等待。需要一把 mutex 保护缓冲区，两个条件变量分别通知"非满"和"非空"：
+**生产者-消费者**包含一个容量有限的共享缓冲区。mutex 保护队列、读写位置和元素计数；`not_empty` 条件变量让消费者等待 `count > 0`，`not_full` 让生产者等待 `count < capacity`。mutex 维护不变量，条件变量避免在状态不满足时持锁忙等，二者不能互相替代。
 
 ```c
-#define BUF_SIZE 10
-int buffer[BUF_SIZE];
-int count = 0;
+/* producer */
+pthread_mutex_lock(&mutex);
+while (count == capacity)
+    pthread_cond_wait(&not_full, &mutex);
+insert_item(item);
+pthread_cond_signal(&not_empty);
+pthread_mutex_unlock(&mutex);
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t not_full  = PTHREAD_COND_INITIALIZER;
-pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
-
-void *producer(void *arg) {
-    for (int i = 0; i < 100; i++) {
-        pthread_mutex_lock(&mutex);
-        while (count == BUF_SIZE)
-            pthread_cond_wait(&not_full, &mutex);   // 满了，等非满
-        buffer[count++] = i;
-        pthread_cond_signal(&not_empty);             // 通知消费者：非空了
-        pthread_mutex_unlock(&mutex);
-    }
-    return NULL;
-}
-
-void *consumer(void *arg) {
-    for (int i = 0; i < 100; i++) {
-        pthread_mutex_lock(&mutex);
-        while (count == 0)
-            pthread_cond_wait(&not_empty, &mutex);  // 空了，等非空
-        int item = buffer[--count];
-        pthread_cond_signal(&not_full);              // 通知生产者：非满了
-        pthread_mutex_unlock(&mutex);
-    }
-    return NULL;
-}
+/* consumer */
+pthread_mutex_lock(&mutex);
+while (count == 0)
+    pthread_cond_wait(&not_empty, &mutex);
+item = remove_item();
+pthread_cond_signal(&not_full);
+pthread_mutex_unlock(&mutex);
 ```
 
-注意两个 `while` 循环：前面讲过条件变量可能虚假唤醒，while 保证唤醒后重新检查条件。
+**读者-写者**要求多个读者可以并发访问，写者与任何其他访问互斥。读写锁直接表达这项策略，但仍要选择读者优先、写者优先或近似公平；策略不同会改变吞吐与饥饿风险。若读临界区很短或写入频繁，普通 mutex 可能更简单、更快。
 
-**读者-写者(Readers-Writers)**。多个读者可以并发读，写者必须独占。用信号量的一种解法：读者计数器 `read_count` 记录当前有多少读者，一把 mutex 保护计数器，一个信号量 `rw_sem` 控制对数据的访问。第一个读者到来时对 `rw_sem` 执行 `down()`（阻止写者），最后一个读者离开时执行 `up()`（允许写者）。写者直接对 `rw_sem` 做 `down()/up()`。这是读者优先的方案，写者可能饥饿，与前面讨论的读写锁写者饥饿问题相同。
+**哲学家就餐**把每个参与者需要同时取得两个资源的情况抽象出来。若所有参与者都先取得左侧资源，再等待右侧资源，就可能形成环形等待。给所有资源规定全局顺序，并要求每个线程按同一顺序获取，可以破坏这个环；限制同时尝试的人数或使用集中协调者也能改变条件。[死锁](/concurrency/03-deadlock)会把这种现象归纳为四个必要条件，并比较预防、避免、检测与恢复。
 
-**哲学家就餐(Dining Philosophers)**。五个哲学家围坐在圆桌旁，两两之间放一根筷子（共五根）。每个哲学家交替思考和吃饭。吃饭需要同时拿起左右两根筷子。
-
-朴素的方案是：每个哲学家先拿左边的筷子，再拿右边的筷子。但如果五个哲学家同时拿起了左边的筷子，所有人都在等右边的筷子，而右边的筷子被右边的哲学家当作左边的筷子拿走了。谁也不愿意放下，所有人都在等，形成循环等待，程序永远不会推进。这就是死锁(deadlock)。
-
-一个简单的解法是打破对称性：前四个哲学家先拿左边再拿右边，第五个哲学家先拿右边再拿左边。这样至少有一个哲学家的获取顺序不同，打破了循环等待的条件。
-
-哲学家就餐的死锁揭示了一个更一般的现象：多个线程按不同顺序获取多个锁时，可能产生循环等待。下一课「死锁」深入分析这个问题。
+三个问题对应三种不同问题：生产者-消费者等待状态，读者-写者选择访问策略，哲学家就餐管理多资源顺序。看到“多个线程”时直接加一把锁并不构成完整设计，必须先判断要保护的不变量、要等待的谓词和可能形成的资源依赖。
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| 竞态条件(race condition) | 程序结果依赖于线程的相对执行顺序 |
-| 临界区(critical section) | 访问共享资源的代码区域，需要互斥保护 |
-| 内存屏障(memory barrier) | 阻止 CPU 跨越屏障重排内存访问 |
-| Test-and-Set / CAS | 硬件原子指令，保证读-改-写不可分割 |
-| 自旋锁(spinlock) | 等待者忙等，适用于短临界区和不可睡眠上下文 |
-| 互斥锁(mutex) | 等待者睡眠，适用于用户态和长临界区 |
-| 信号量(semaphore) | 计数器 + 等待队列，P/V 操作，控制并发数量 |
-| 条件变量(condition variable) | 等待特定条件成立，与 mutex 配合，必须在 while 中调用 |
-| 读写锁(rwlock) | 多个读者并发 OR 一个写者独占 |
-| Futex | 系统调用，提供"按地址等待/唤醒"能力，是用户态所有同步原语的基础设施 |
+| 竞态与临界区 | 找出依赖时序的共享不变量，并规定受保护访问区间 |
+| 数据竞争 | 没有先行发生关系的冲突非原子访问，在 C 中属于未定义行为 |
+| 原子操作 | 对单个对象执行不可分割的读、写或读改写 |
+| 内存序 | 规定多个对象的访问以什么顺序被线程观察 |
+| 测试并设置 / CAS | 构造原子状态转换和重试循环的硬件语义 |
+| 锁 | 用自旋、阻塞或读写模式互斥进入临界区 |
+| 信号量 | 保存许可数量并在许可不足时阻塞 |
+| 条件变量 | 配合 mutex 等待共享谓词可能变为真 |
+| 丢失唤醒 | 状态检查与登记等待不原子时永久错过通知 |
+| Futex | 按用户空间值比较后阻塞或按地址唤醒的 Linux 接口 |
+| 经典同步问题 | 组合互斥、条件等待、计数和锁顺序的分析模式 |
 
-同步原语构成一条从硬件到用户态的垂直链：CPU 提供原子指令（CAS/TAS）和内存屏障，内核在此之上实现 futex（原子的 check-and-sleep），用户态库在 futex 之上封装 mutex、semaphore、condition variable。理解这条链，就理解了为什么每一层存在、每一层解决什么问题。
+同步不是“阻止线程同时运行”，而是为共享状态建立原子性、可见顺序与等待协议；只有先确定不变量和谓词，再选择原子操作、锁、条件变量或 futex 层级，才能同时解释程序为何正确以及等待为何能够结束。
 
 ---
 
-**Linux 源码入口**：
-- [`kernel/futex/`](https://elixir.bootlin.com/linux/latest/source/kernel/futex) — futex 系统调用实现
-- [`kernel/locking/mutex.c`](https://elixir.bootlin.com/linux/latest/source/kernel/locking/mutex.c) — 内核 mutex 实现，包含 optimistic spinning
-- [`include/linux/atomic.h`](https://elixir.bootlin.com/linux/latest/source/include/linux/atomic.h) — 内核原子操作接口
-- [`nptl/lowlevellock.h`](https://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/lowlevellock.h) — glibc 基于 futex 的底层锁实现
+**Linux 源码与接口入口**：
+- [`pthread_mutex_lock(3p)`](https://man7.org/linux/man-pages/man3/pthread_mutex_lock.3p.html)：POSIX mutex 所有权与错误语义
+- [`pthread_cond_wait(3p)`](https://man7.org/linux/man-pages/man3/pthread_cond_wait.3p.html)：原子释放、等待和重新加锁
+- [`sem_wait(3)`](https://man7.org/linux/man-pages/man3/sem_wait.3.html)：POSIX semaphore 计数与阻塞
+- [`futex(2)`](https://man7.org/linux/man-pages/man2/futex.2.html)：futex word、WAIT、WAKE 与比较后阻塞
+- [Linux kernel memory barriers](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)：原子性、屏障与内存顺序
+- [Atomic types](https://docs.kernel.org/core-api/wrappers/atomic_t.html)：Linux 内核原子读改写接口
+- [`kernel/futex/`](https://github.com/torvalds/linux/tree/master/kernel/futex)：futex key、哈希等待队列与唤醒路径
+- [`kernel/locking/mutex.c`](https://github.com/torvalds/linux/blob/master/kernel/locking/mutex.c)：内核 mutex 的快速路径、等待队列与乐观自旋
+- [`nptl/lowlevellock.c`](https://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/lowlevellock.c)：glibc 低层锁的 futex 慢速路径

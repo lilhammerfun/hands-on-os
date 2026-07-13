@@ -1,379 +1,285 @@
 # 信号
 
-- 写作时间：`2026-02-27 首次提交，2026-03-23 最近修改`
-- 当前字符：`11743`
+- 写作时间：`2026-02-27 首次提交，2026-07-13 最近修改`
+- 当前字符：`10048`
 
-上一课讲了进程的创建、执行和回收，但进程在运行过程中，有时需要被外部打断。来看这样一个场景：在终端运行 `sleep 100`，然后按 Ctrl+C，程序立刻退出了。
+在[进程生命周期](/process/01-lifecycle)中，父进程可以主动调用 `waitpid()` 等待子进程。但是许多事件不会等到程序下一次主动查询：用户可能按下 Ctrl+C，定时器可能到期，子进程也可能在父进程处理其他工作时退出。
 
-```
+在终端运行 `sleep 100` 并按 Ctrl+C，可以直接看到这种控制流变化：
+
+```console
 $ sleep 100
 ^C
 $
 ```
 
-但 `sleep` 正在睡觉，它没有在读键盘输入，也没有在检查"用户是不是按了什么键"。它就是在那儿等着，什么都不做。一个什么都不做的进程，怎么会知道按了 Ctrl+C？
+`sleep` 此时没有读取键盘，也没有循环检查按键。终端子系统识别 Ctrl+C 后，请求内核向前台进程发送 `SIGINT`；`SIGINT` 的默认动作是终止进程，所以 `sleep` 提前结束。若程序安装了处理函数，也可以先设置状态标志，再由普通控制流决定怎样退出，而不是只能接受默认动作。
 
-让它自己来检查？`sleep` 的工作就是"等着不动"，不会运行任何检查代码。内核直接杀死它？如果程序正在写文件写到一半，直接杀死会导致文件损坏。核心问题是：**需要从外部打断一个进程的执行流，而且要让它有机会响应。**
-
-硬件世界解决过同样的问题：**中断**(interrupt)。网卡收到数据包时通过电信号打断 CPU，CPU 跳到预先注册的处理代码执行。**信号**(signal) 是这个思路搬到进程层面，不是设备打断 CPU，而是内核打断进程。内核在进程的待处理集合中标记一个信号，下次该进程被调度运行时，强制跳转到处理代码。
-
-信号就是这个机制。先看**信号机制**本身——内核用什么数据结构记录信号、怎么投递。进程收到信号后有三种选择：默认动作、忽略、自定义处理函数，这就是**处置**。Ctrl+C 是怎么变成 SIGINT 的？这条路径经过**终端驱动**。信号不只来自键盘，**信号来源**有三种：终端、内核、其他进程。fork 和 exec 时信号的处置怎么传递给子进程？这就是**信号继承**规则。最后，信号机制最重要的应用之一：父进程通过 **SIGCHLD** 知道子进程退出了，从而及时回收僵尸。
+本课先建立信号从生成到递送的**信号机制**，再解释默认、忽略和处理函数三种**处置**。随后沿 Ctrl+C 的路径分析**终端驱动**，归纳其他**信号来源**，再用 fork 与 exec 推导**信号继承**，最后用 **SIGCHLD** 连接子进程退出与父进程回收。
 
 ## 信号机制
 
-信号(signal)是内核强制打断进程执行流、让进程有机会响应异步事件的机制。
+信号是由内核递送的有限通知机制，它可以在普通函数调用顺序之外改变进程或线程的执行状态。
 
-信号在内核中用两样东西表示，都存在每个进程的 `task_struct` 中：
+“发送一个信号”并不等于处理函数已经开始执行。完整过程分成三个阶段：
 
-**处置数组：每个信号一个槽位。**
+1. **生成**：某个事件发生，内核为目标记录一个信号
+2. **挂起(pending)**：信号已经生成，但尚未递送
+3. **递送(delivery)**：内核选中一个未被阻塞的挂起信号，并执行它的当前处置
 
-```c
-// simplified
-struct k_sigaction  action[64];
-```
+阻塞(blocking)表示暂缓递送某个信号，而不是丢弃它。每个线程都有信号掩码(signal mask)，其中列出的信号暂时不能递送；解除阻塞后，仍在 pending 集合中的信号才有机会被处理。线程是进程中的一条执行流，多线程会在并发章节展开，这里只需要区分：处置属于整个进程，掩码属于各个线程。
 
-64 元素的数组，下标是信号编号。`action[2]` 存的是 SIGINT（编号 2）的处置：`SIG_DFL`、`SIG_IGN`、或一个 handler 函数指针。进程调用 `sigaction(SIGINT, ...)` 时，内核做的事就是写 `action[2]`。
+Linux 用几组相互关联的状态表达这些概念：
 
-**待处理位图：每个信号一个 bit。**
+| 语义 | Linux 中的主要位置 | 共享范围 |
+|------|-------------------|----------|
+| 信号处置 | `sighand_struct.action[]` | 进程内线程共享 |
+| 进程定向 pending | `signal_struct.shared_pending` | 进程内线程共享 |
+| 线程定向 pending | `task_struct.pending` | 当前线程 |
+| 信号掩码 | `task_struct.blocked` | 当前线程 |
 
-```c
-sigset_t  pending;   // bitmap: bit N = 1 means signal N is pending
-```
+进程定向信号可以递送给任意一个未阻塞该信号的线程；线程定向信号只能递送给指定线程。单线程程序只有一条执行流，暂时可以把两者都理解成“发给这个进程”，但内核仍保留这一区分。
 
-当内核要给进程发 SIGINT 时，把 `pending` 的第 2 位设为 1。进程从内核态返回用户态时（系统调用返回、中断处理完毕），内核检查 `pending` 位图。如果有位为 1，取出对应的信号编号，查 `action[]` 中的处置，按结果执行。
+内核准备从内核态返回用户态时，会检查当前线程是否存在未阻塞的挂起信号。若处置是用户处理函数(handler)，内核不会在内核态直接调用这个函数，而是在用户栈上建立信号帧(signal frame)，保存被打断位置的寄存器与信号掩码，再把用户态指令位置改为处理函数入口。处理函数返回时，C 库提供的信号跳板(signal trampoline)调用 `rt_sigreturn`，内核据此恢复原来的寄存器、栈和掩码。
 
 ```mermaid
 sequenceDiagram
     participant S as Event Source
     participant K as Kernel
-    participant P as Target Process
+    participant P as Target Thread
 
-    S->>K: 事件发生（Ctrl+C / 子进程退出 / kill()）
-    K->>K: 设 pending 位图的对应 bit 为 1
+    S->>K: event or kill() request
+    K->>K: generate signal, mark it pending
+    Note over K,P: blocked signals remain pending
+    K->>K: choose an unblocked pending signal
+    K->>K: inspect its disposition
 
-    Note over K,P: 进程可能正在睡眠<br/>信号在 pending 中等待<br/>（所以信号是异步的）
-
-    K->>K: 进程被调度运行时，检查 pending，取出信号
-    K->>K: 查 action[] 中该信号的处置
-
-    alt SIG_DFL（默认动作）
-        K->>P: 执行内核预定义动作（终止 / 停止 / 继续 / 无动作）
-    else SIG_IGN（忽略）
-        Note over K: 丢弃信号，什么都不发生
-    else 自定义 handler
-        K->>P: 保存当前执行位置，跳转到 handler
-        P->>P: 执行 handler 函数
-        P-->>K: handler 返回
-        K->>P: 恢复执行位置，继续原来的工作
+    alt SIG_DFL
+        K->>P: apply default action
+    else SIG_IGN
+        Note over K: discard the signal
+    else user handler
+        K->>P: build signal frame and return to handler
+        P->>P: run handler in user mode
+        P-->>K: rt_sigreturn
+        K->>P: restore interrupted user context
     end
 ```
 
-停一下，注意这个设计的精妙之处：信号的"发送"和"处理"是解耦的。发送方只是在位图上设一个 bit，不需要等接收方在线。接收方在下次被调度时才检查位图。这就是为什么信号是异步的。
+标准信号通常用集合表达挂起状态。同一种标准信号在阻塞期间生成多次，通常只保留“至少发生过一次”，解除阻塞后可能只递送一次。实时信号(real-time signal)则可以排队保存多个实例和附带数据。由此，标准信号适合表达状态变化通知，不适合充当可靠的事件计数器。
 
 ## 处置
 
-处置决定信号到达时进程怎么响应。每个信号都有一个当前处置。
+处置(disposition)是进程针对某个信号选择的递送动作，每个信号都有一个当前处置。
 
-进程启动时，所有信号的处置都是 `SIG_DFL`（默认）。默认动作由内核为每个信号预定义，不同信号的默认动作不同：
+内核为每个信号定义默认动作(`SIG_DFL`)；进程还可以选择忽略(`SIG_IGN`)或安装用户处理函数。核心转储(core dump)是按系统配置保存进程部分内存与寄存器状态、供调试器分析的文件。常见默认动作如下：
 
 | 默认动作 | 说明 | 信号举例 |
 |----------|------|----------|
-| 终止 (Term) | 进程退出 | SIGINT, SIGTERM, SIGPIPE, SIGHUP |
-| 终止 + 核心转储 (Core) | 退出并生成 core dump | SIGQUIT, SIGSEGV, SIGABRT |
-| 停止 (Stop) | 暂停进程（可恢复） | SIGTSTP, SIGSTOP, SIGTTIN, SIGTTOU |
-| 继续 (Cont) | 恢复已停止的进程 | SIGCONT |
-| 无动作 | 信号被丢弃 | SIGCHLD, SIGURG |
+| 终止(Term) | 结束进程 | `SIGINT`、`SIGTERM`、`SIGPIPE`、`SIGHUP` |
+| 核心转储(Core) | 结束进程并按配置生成 core dump | `SIGQUIT`、`SIGSEGV`、`SIGABRT` |
+| 停止(Stop) | 暂停进程，可由 `SIGCONT` 恢复 | `SIGTSTP`、`SIGSTOP`、`SIGTTIN`、`SIGTTOU` |
+| 继续(Cont) | 恢复已停止进程 | `SIGCONT` |
+| 忽略(Ign) | 默认不改变进程状态 | `SIGCHLD`、`SIGURG` |
 
-进程可以用 `sigaction()` 把某个信号的处置改为：
+默认忽略与显式设置 `SIG_IGN` 通常结果相似，但 `SIGCHLD` 是重要例外。在 Linux 上保留 `SIGCHLD` 的默认处置时，终止的子进程仍然可以等待并可能成为僵尸；显式设置 `SIG_IGN` 或使用 `SA_NOCLDWAIT`，则会让终止状态自动回收。需要读取子进程状态的 shell 不能采用后者。
 
-- **忽略**（`SIG_IGN`）：信号到达时什么都不做，静默丢弃
-- **自定义 handler**（函数指针）：信号到达时跳转到指定函数执行
-- 改回**默认**（`SIG_DFL`）
+`SIGKILL` 和 `SIGSTOP` 不能被捕获、忽略或阻塞，因此目标进程无法自行改写它们的动作。发送方仍需通过权限检查，而且处于不可中断内核等待中的任务也可能要等到相应内核路径结束后才能表现出动作，所以“不可捕获”不等于“发送后在同一瞬间完成”。
 
-注意"忽略"和上表中的"无动作"的区别。SIGCHLD 的默认动作是"无动作"，这和主动设置 `SIG_IGN` 看似一样，但含义不同：默认是"我没管过这个信号"，`SIG_IGN` 是"我明确选择忽略它"。对于 SIGCHLD，两者甚至有行为差异：`SIG_IGN` 会让子进程被自动回收，不产生僵尸。
+POSIX 推荐用 `sigaction()` 检查或修改处置：
 
-**SIGKILL (9) 和 SIGSTOP (19) 的处置永远锁定为内核默认动作。** 无论进程怎么调用 sigaction，这两个信号都不受影响。这是操作系统的安全兜底，确保管理员始终能终止或暂停任何进程。
+```c
+#include <signal.h>
 
-Shell 开发中最常遇到的信号：
+int sigaction(int signum,
+              const struct sigaction *act,
+              struct sigaction *oldact);
+```
 
-| 信号 | 编号 | 默认动作 | 触发场景 |
-|------|------|----------|----------|
-| SIGHUP | 1 | 终止 | 控制终端断开（关闭终端窗口） |
-| SIGINT | 2 | 终止 | 用户按 Ctrl+C |
-| SIGQUIT | 3 | 核心转储 | 用户按 Ctrl+\\ |
-| SIGKILL | 9 | 终止 | `kill -9`，不可捕获 |
-| SIGPIPE | 13 | 终止 | 写入无读端的管道 |
-| SIGTERM | 15 | 终止 | `kill` 命令的默认信号 |
-| SIGCHLD | 17 | 无动作 | 子进程终止或停止 |
-| SIGCONT | 18 | 继续 | `fg` / `bg` 恢复暂停进程 |
-| SIGSTOP | 19 | 停止 | 不可捕获的暂停 |
-| SIGTSTP | 20 | 停止 | 用户按 Ctrl+Z |
+`act->sa_handler` 指定 `SIG_DFL`、`SIG_IGN` 或处理函数；`sa_mask` 指定处理函数运行期间额外阻塞的信号；`sa_flags` 调整递送行为。默认情况下，正在处理的那个信号也会暂时加入当前线程的掩码，防止同一个处理函数立即递归进入，除非使用 `SA_NODEFER` 改变这一行为。
 
-> 编号为 x86_64 Linux 上的值。Zig 代码中使用 `SIG.INT`、`SIG.CHLD` 等常量，不要硬编码数字。
-
-`sigaction()` 是修改处置的系统调用。它接受三个参数：信号编号、新的处置、以及一个用于保存旧处置的输出参数。注册处置时需要指定三样东西：
-
-1. **handler**：处置方式。`SIG_DFL`（默认）、`SIG_IGN`（忽略）、或自定义函数指针。
-2. **mask**：handler 执行期间要额外阻塞哪些信号。当内核调用 handler 时，会自动阻塞触发信号本身（比如 SIGINT handler 执行期间，再来一个 SIGINT 不会打断它）。mask 让你指定除此之外还要阻塞哪些信号。被阻塞的信号不会丢失，暂时挂在 `pending` 里，等 handler 返回后再递送。大多数情况下不需要额外阻塞任何信号。
-3. **flags**：控制信号处理的行为细节。最重要的是 `SA_RESTART`。
-
-进程正在执行慢速系统调用（如 `read` 等待用户输入）时，如果收到信号，内核会**中断系统调用**去执行 handler。handler 返回后：
-
-- **没有 SA_RESTART**：系统调用返回 `EINTR` 错误，程序必须自己重试
-- **设置了 SA_RESTART**：内核自动重新执行被中断的系统调用，对程序透明
-
-Shell 读取用户输入用的是 `read`（慢速系统调用），如果不设 `SA_RESTART`，每次信号都会打断读取，需要额外的重试逻辑。
+`SA_RESTART` 允许 Linux 在处理函数返回后自动重启一部分被中断的阻塞接口。例如，对终端或管道执行、尚未传输数据的 `read()` 可能被重启。它不是对所有系统调用的统一保证：具体行为取决于接口，有些调用即使设置了 `SA_RESTART` 仍会返回 `-1` 并设置 `errno = EINTR`。程序必须按所用接口的文档决定是否重试，不能把 `SA_RESTART` 当成通用错误处理替代品。
 
 ## 终端驱动
 
-终端驱动(terminal driver)是内核中负责处理终端输入输出的模块。它不只搬运数据，还通过行规程(line discipline)拦截特殊字符并触发控制动作。Ctrl+C 变成 SIGINT 的过程就发生在终端驱动中。
+终端驱动(terminal driver)是 Linux TTY 子系统中管理终端设备语义的内核部分，行规程(line discipline)则负责输入编辑和特殊控制字符。
 
-Ctrl+C 本身只是一个键盘输入，产生 ASCII 码 `0x03`（ETX，End of Text）。它和信号之间没有硬连线的关系。连接它们的是行规程。行规程维护一张映射表（存在 `termios` 结构体中），其中有一项：
+终端是可以被进程读写的 TTY 端点。会话可以拥有一个控制终端(controlling terminal)，控制终端又记录一个前台进程组(foreground process group)。进程组是由同一个进程组 ID(Process Group ID, PGID)标识的一组相关进程；终端产生的交互信号会发给整个前台组，而不是只发给某一个进程。
 
-```
-INTR character = 0x03 (Ctrl+C)
-```
+典型终端模拟器把 Ctrl+C 编码为字节 `0x03`。终端属性结构(termios)保存输入模式、控制字符和回显等设置。当其中的 `ISIG` 标志启用，且 `c_cc[VINTR]` 配置为 `0x03` 时，行规程识别这个字节，不把它作为普通输入交给 `read()`，而是向前台进程组生成 `SIGINT`。规范模式(canonical mode)会先在内核中按行缓冲并编辑输入，遇到换行或配置的结束字符后才把一条输入记录交给 `read()`：
 
-当行规程收到 `0x03`，它不会把这个字节传给正在读终端的进程，而是通知内核：向终端的**前台进程组**发送 SIGINT。
-
-这个映射是可以改的。`stty intr ^X` 可以把 INTR 字符改成 Ctrl+X，之后按 Ctrl+C 就只是普通输入，按 Ctrl+X 才发 SIGINT。Ctrl+C 和 SIGINT 之间不是固定的，是终端驱动的配置决定的。这个细节很容易被忽略。
-
-行规程识别的特殊字符：
-
-| 字符 | 默认按键 | 行规程的动作 |
-|------|----------|-------------|
-| INTR | Ctrl+C | 向前台进程组发 SIGINT |
-| QUIT | Ctrl+\\ | 向前台进程组发 SIGQUIT |
-| SUSP | Ctrl+Z | 向前台进程组发 SIGTSTP |
-| EOF | Ctrl+D | 通知读端"输入结束" |
-| ERASE | Backspace | 删除前一个字符 |
+| 配置项 | 默认按键 | 行规程的动作 |
+|--------|----------|-------------|
+| `VINTR` | Ctrl+C | 向前台进程组生成 `SIGINT` |
+| `VQUIT` | Ctrl+\ | 向前台进程组生成 `SIGQUIT` |
+| `VSUSP` | Ctrl+Z | 向前台进程组生成 `SIGTSTP` |
+| `VEOF` | Ctrl+D | 在规范模式中结束当前输入记录；空记录可使 `read()` 返回 0 |
+| `VERASE` | Backspace | 在规范模式中删除尚未提交的前一个字符 |
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant T as Terminal Driver (Line Discipline)
-    participant K as Kernel
+    participant T as TTY Line Discipline
+    participant K as Kernel Signal Code
     participant P as Foreground Process Group
 
-    U->>T: 按下 Ctrl+C（ASCII 0x03）
-    T->>T: 查 termios，发现 0x03 是 INTR 字符
-    T->>K: 请求向前台进程组发送 SIGINT
-    K->>P: 对组内每个进程：设 pending 第 2 位为 1
-    P->>P: 各进程按自己的 action[2] 执行处置
+    U->>T: Ctrl+C becomes byte 0x03
+    T->>T: ISIG enabled and c_cc[VINTR] is 0x03
+    T->>K: generate SIGINT for foreground process group
+    K->>P: mark SIGINT pending for group members
+    P->>P: each process applies its disposition
 ```
 
-:::expand 终端与伪终端
+`stty intr '^X'` 可以把 `VINTR` 改成 Ctrl+X；关闭 `ISIG` 的原始模式程序则会把 Ctrl+C 当作普通字节读取。由此，Ctrl+C 并非 CPU 或键盘硬件直接绑定到 `SIGINT`，而是终端配置定义的控制字符。
 
-"终端驱动"和内核、shell 是什么关系？硬件设备不能直接和用户程序对话，中间需要内核模块负责翻译，这就是**驱动(driver)**：
+:::expand 伪终端
+伪终端(pseudoterminal, PTY)由 master 与 slave 两端组成。终端模拟器或 SSH 服务端操作 master，shell 和前台命令通常把 slave 作为控制终端。写入 master 的字节进入 slave 一侧的 TTY 行规程，slave 上程序的输出则可以从 master 读出。
 
-```
-User programs (shell, cat, vim ...)
-─────────────────────────────────────
-            Kernel
-  ┌───────────────────────────┐
-  │  Drivers                  │
-  │  · Keyboard driver        │ ← translates scancodes to key events
-  │  · NIC driver             │ ← translates packets to socket data
-  │  · Disk driver            │ ← translates block I/O to file read/write
-  │  · Terminal driver        │ ← translates key bytes to input stream + control actions
-  └───────────────────────────┘
-─────────────────────────────────────
-Hardware (keyboard, NIC, disk, serial ...)
-```
-
-终端驱动特殊在哪？大多数驱动只做数据搬运（网卡驱动把字节从网卡搬到内核缓冲区），但终端驱动多了行规程这一层，它会拦截特殊字符触发控制动作。
-
-历史上终端是独立的物理设备（如 DEC VT100），自带键盘和屏幕，通过串口线连接主机。现在没有物理终端了。iTerm2、GNOME Terminal 这些终端模拟器是普通 GUI 程序，在屏幕上画一个窗口来模拟过去物理终端的行为。
-
-内核用**伪终端(PTY, pseudo-terminal)**，即一对虚拟文件描述符，来连接终端模拟器和终端驱动，模拟过去的串口连接。终端模拟器写入 PTY 的一端，终端驱动从另一端读取。
-
-按下键盘到 shell 收到输入的完整路径：
-
-```
-Physical keyboard
-  → Keyboard driver (kernel): scancodes → key events
-    → GUI system (X11 / Wayland / macOS): key events → characters
-      → Terminal emulator (iTerm2 etc., userspace): writes characters to PTY
-        → Terminal driver + line discipline (kernel): handles special chars, buffers normal chars
-          → shell (userspace): read() gets input
-```
-
-终端驱动不知道也不关心输入来自物理键盘、SSH 连接还是一段脚本，它只处理从 PTY 收到的字节流。终端是一个**抽象层**，不绑定任何具体硬件。
-
+PTY 让图形终端窗口和远程登录复用与串口终端相同的 TTY 接口。它模拟的是终端连接，不要求背后存在物理串口设备。
 :::
 
-每个终端有一个"前台进程组"(foreground process group)。当 shell 启动一个命令（如 `sleep 5`），Ctrl+C 产生的 SIGINT 发给前台进程组里的**所有进程**。
-
-> 进程组和会话的完整机制见[进程组与会话](03-process-group)。
+[进程组与会话](/process/03-process-group)会继续解释 shell 怎样设置前台 PGID，以及为什么后台进程不能任意读取控制终端。
 
 ## 信号来源
 
-Ctrl+C 只是信号的来源之一。发信号的来源一共有三种，但本质相同：**只有内核能发信号。**
+信号来源(signal source)是导致内核为目标进程或线程生成信号的事件或系统调用请求。
 
-**终端驱动。** 上一节讲过。用户按下特殊按键，行规程识别后通知内核发信号。这条路径只能产生几个固定的信号（SIGINT、SIGQUIT、SIGTSTP），而且只发给前台进程组。
+终端特殊字符、子进程状态变化、定时器到期和其他进程请求都可以产生信号。最终的权限检查、pending 状态更新与递送仍由内核完成。
 
-**内核自身。** 内核在处理某些事件时，主动给相关进程发信号：
+有些信号与当前线程执行的指令同步发生。例如非法内存访问产生 `SIGSEGV`，如果处理函数直接返回而没有修复地址映射或改变控制流，同一条指令可能再次触发故障。另一些信号与目标当前执行位置无关，例如其他进程发送的 `SIGTERM` 或子进程退出产生的 `SIGCHLD`。
 
-| 内核事件 | 产生的信号 | 目标进程 |
-|----------|-----------|---------|
-| 子进程退出或停止 | SIGCHLD | 父进程 |
-| 进程访问非法内存 | SIGSEGV | 出错的进程自己 |
-| 进程执行非法指令 | SIGILL | 出错的进程自己 |
-| 写入无读端的管道 | SIGPIPE | 写端进程 |
-| 定时器到期 | SIGALRM | 设定定时器的进程 |
+| 事件 | 产生的信号 | 目标 |
+|------|-----------|------|
+| 子进程退出、停止或继续 | `SIGCHLD` | 父进程 |
+| 当前指令访问非法内存 | `SIGSEGV` | 出错线程 |
+| 当前指令无法由处理器执行 | `SIGILL` | 出错线程 |
+| 写入没有读端的管道 | `SIGPIPE` | 写入方 |
+| 定时器到期 | `SIGALRM` | 设置定时器的进程 |
+| TTY 识别 `VINTR` | `SIGINT` | 前台进程组 |
 
-**其他进程。** 任何进程都可以通过 `kill()` 系统调用给另一个进程发信号（需要权限，通常要求同一用户或 root）：
+进程可以用 `kill()` 请求内核发送信号：
 
-```zig
-// send SIGTERM to PID 1234
-std.os.linux.kill(1234, std.posix.SIG.TERM);
+```c
+#include <signal.h>
+#include <sys/types.h>
+
+int kill(pid_t pid, int sig);
 ```
 
-Shell 里的 `kill` 命令就是这个系统调用的封装：
+`pid` 为正数时指定单个进程，为 `0` 或负数时还可以按调用者所在组或指定进程组发送。接口名虽然是 `kill`，却能发送任意允许的信号；`sig = 0` 甚至只做目标与权限检查，不递送信号。调用是否获准取决于进程凭据、目标关系和 `CAP_KILL` 等规则，不能理解为任意进程都能控制任意目标。
 
-```
-$ kill 1234        # send SIGTERM (default)
-$ kill -9 1234     # send SIGKILL
-```
-
-三种来源归结为同一件事。真正在 `pending` 位图上设 bit 的都是内核代码。终端驱动是内核的一部分，直接调用内核内部的信号发送函数（`send_sig_info()`）。用户进程不在内核中，必须通过 `kill()` 系统调用跨越用户态/内核态边界，请求内核执行同一个函数。
+shell 的 `kill 1234` 默认请求发送 `SIGTERM`，`kill -KILL 1234` 则请求发送 `SIGKILL`。`SIGTERM` 可以被处理，使服务有机会有序退出；`SIGKILL` 无法被目标处理，通常只在正常终止无效时使用。
 
 ## 信号继承
 
-shell 会忽略 SIGINT（这样 Ctrl+C 不会杀死 shell 自己）。但 shell 需要 fork + exec 来启动子进程。**shell 忽略了 SIGINT，fork 出来的子进程也忽略 SIGINT 吗？**
+信号继承(signal inheritance)是 fork 与 exec 对处置、掩码和 pending 状态分别采用的保留规则。
 
-这个问题非常关键。答案要从 fork 和 exec 分别做了什么来推导。
+fork 创建新进程，exec 则在同一进程中替换程序映像，因此两者的规则不同：
 
-fork 把当前进程复制一份。信号相关的两样东西，内核做了不同的决策：
+| 信号状态 | `fork()` 后的子进程 | `execve()` 后的同一进程 |
+|----------|--------------------|--------------------------|
+| 默认或忽略处置 | 复制父进程处置 | 保持不变 |
+| 自定义处理函数 | 复制父进程处置 | 重置为 `SIG_DFL` |
+| 信号掩码 | 复制父线程掩码 | 保持不变 |
+| pending 集合 | 新子进程从空集合开始 | 保持原 pending 集合 |
 
-**处置数组 `action[64]`：复制。** 子进程得到一份独立的副本，初始值和父进程一样。父进程的 `action[2]` 是 SIG_IGN，子进程的 `action[2]` 也是 SIG_IGN。之后各改各的，互不影响。理由：处置代表进程"遇到信号时该怎么做"的策略，子进程作为副本，继承同样的策略是合理的起点。
+exec 必须重置自定义处理函数，因为函数地址属于旧程序映像，替换地址空间后已不再有效。`SIG_DFL` 与 `SIG_IGN` 不引用旧程序代码，所以能够保留。信号掩码与 pending 状态是内核维护的进程或线程状态，也不因加载新程序而自动清空。
 
-**待处理位图 `pending`：不复制，从全 0 开始。** pending 里的信号是别人发给父进程的，是父进程的"待办事项"。子进程是一个新的进程，还没有人给它发过信号，从空白开始更合理。
+这组规则直接影响 shell。支持作业控制的交互式 shell 会把前台作业放进不同于 shell 的进程组，再把控制终端交给该作业，因此 Ctrl+C 通常只发给前台作业；shell 自身仍会为 `SIGINT` 等信号设置适合交互循环的处置。fork 创建的子进程会继承这些处置和掩码，所以如果其中的 `SIGINT` 处于忽略或阻塞状态，直接 exec 后的新程序仍可能无法按默认方式响应 Ctrl+C。单线程 shell 可以在 exec 前恢复目标程序需要的默认处置和信号掩码：
 
-exec 则不同，它替换进程的整个地址空间。考虑 `action[]` 中三种值在 exec 后的命运：
-
-**SIG_DFL 和 SIG_IGN**：常量 0 和 1，不依赖旧程序的任何代码。地址空间换了对它们没有影响。exec 后保持不变。
-
-**自定义 handler**：函数指针，指向旧程序代码段中某个函数的地址。exec 之后旧程序的代码不存在了，这个指针指向未知位置。内核在 exec 时**必须**把所有自定义 handler 重置为 SIG_DFL。
-
-这不是一条需要记忆的规则。它是从 exec 的行为（替换地址空间导致旧的函数指针失效）直接推导出来的。
-
-把这两条规则应用到 shell：shell 忽略 SIGINT（`action[2]` = SIG_IGN），然后 fork + exec：
-
-1. fork：子进程复制了 `action[2]` = SIG_IGN
-2. exec：SIG_IGN 是常量，不受地址空间替换的影响，保持不变
-3. 子进程执行的 `sleep` 也忽略 SIGINT。用户按 Ctrl+C，sleep 无反应。**这是一个 bug。**
-
-**修复**：子进程在 fork 后、exec 前，把 SIGINT 重置为 SIG_DFL。fork 和 exec 之间是一段可以写任意代码的区间（上一篇 fork-exec 分离一节的核心论点），在这里重置处置：
-
-```zig
-const pid = try posix.fork();
+```c
+pid_t pid = fork();
 
 if (pid == 0) {
-    // child calls sigaction — modifies its own disposition array
-    const dfl = posix.Sigaction{
-        .handler = .{ .handler = posix.SIG.DFL },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &dfl, null);
+    struct sigaction action = { .sa_handler = SIG_DFL };
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
 
-    return posix.execvpeZ(cmd, argv, envp);
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+
+    execlp("sleep", "sleep", "100", (char *)NULL);
+    _exit(127);
 }
 ```
 
-这是所有 shell 都必须做的事。`bash`、`zsh` 的源码中都有类似逻辑。
-
-注意：如果 shell 用的是自定义 handler（而非 SIG_IGN）来处理 SIGINT，就不需要手动重置，自定义 handler 在 exec 时会被内核自动重置为 SIG_DFL（函数指针失效，必须重置）。但 shell 的标准做法是用 SIG_IGN（收到 SIGINT 时 shell 不需要执行任何逻辑，只需要不死），所以必须手动重置。
+示例清空了全部阻塞信号以突出机制；真实 shell 会按自身策略恢复一组精确的处置与掩码。关键顺序不变：先在 fork 出的子进程中配置，再用 exec 加载目标程序。
 
 ## SIGCHLD
 
-SIGCHLD 是"内核自己发信号"的一个重要实例。子进程退出后变成僵尸，父进程必须调用 `waitpid()` 回收。但父进程怎么知道子进程退出了？
+`SIGCHLD` 是子进程停止、继续或终止时，内核向父进程生成的状态变化通知。
 
-**内核在子进程退出时，主动向父进程发送 SIGCHLD。** 内核在执行子进程的 `exit()` 时，找到它的父进程，在父进程的 `pending` 位图中把 SIGCHLD（第 17 位）设为 1。
+前台命令期间，shell 可以直接阻塞在 `waitpid()` 中。后台命令则不同：shell 必须继续读取新输入，不能一直等待某一个子进程。`SIGCHLD` 让父进程在处理其他工作时仍能知道“至少有一个子进程状态发生了变化”。
 
-一种做法是注册 SIGCHLD handler，在里面调用 `waitpid`：
+`SIGCHLD` 是标准信号，同一信号的多个实例可能合并。假设三个子进程几乎同时退出，父进程不能假设一定收到三次处理函数调用。每次开始回收时都应循环调用：
 
-```zig
-fn sigchld_handler(sig: i32) callconv(.c) void {
-    _ = sig;
-    // loop with WNOHANG to reap all exited children
-    while (true) {
-        const result = posix.waitpid(-1, posix.W.NOHANG);
-        if (result.pid == 0) break;  // no more exited children
+```c
+int status;
+pid_t pid;
+
+while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    /* record pid and status */
+}
+```
+
+`pid = -1` 表示检查任意子进程，`WNOHANG` 表示当前没有可等待状态时立即返回 0，而不是阻塞。循环直到返回 0，才能一次处理当前已经积累的全部终止状态。需要跟踪作业暂停和恢复的 shell 还会加入 `WUNTRACED` 与 `WCONTINUED`，让 `waitpid()` 同时报告停止和继续状态。
+
+信号处理函数可能在普通代码执行到任意可递送位置时运行，所以它只能调用异步信号安全(async-signal-safe)的接口。异步信号安全表示函数即使打断了程序正在进行的其他操作，也不会依赖可能处于半更新状态的共享内部数据。
+
+| 处理函数中可安全使用的例子 | 不应使用的例子 |
+|----------------------------|----------------|
+| `write()`、`waitpid()`、`_exit()` | `printf()`、`malloc()`、`free()` |
+| 对 `volatile sig_atomic_t` 赋值 | 获取普通互斥锁、修改复杂容器 |
+
+一种简单分工是让处理函数只设置标志，主循环再调用 `waitpid()` 并更新作业表：
+
+```c
+static volatile sig_atomic_t got_sigchld;
+
+static void on_sigchld(int signo) {
+    (void)signo;
+    got_sigchld = 1;
+}
+
+/* in the main loop */
+if (got_sigchld) {
+    got_sigchld = 0;
+
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        /* update normal program state here */
     }
 }
 ```
 
-但这有一个严重问题：**async-signal-safety**。
-
-:::expand async-signal-safety
-
-信号 handler 可以在程序的**任何时刻**被调用，包括 `malloc` 执行到一半、持有锁的时候。如果 handler 里也调用 `malloc`，就会死锁或破坏堆。这是个坑，很多人栽在这里。
-
-POSIX 定义了一个 "async-signal-safe" 函数列表，**只有这些函数才能在 handler 中安全调用**：
-
-| 可以调用 | 不可以调用 |
-|----------|-----------|
-| `write()` | `printf()` / `std.debug.print()` |
-| `waitpid()` | `malloc()` / `free()` |
-| `_exit()` | 任何分配内存的操作 |
-| 设置全局 flag | 获取锁 |
-
-:::
-
-更安全的做法：handler 里只设一个标志，主循环中检查标志并回收：
-
-```zig
-// global flag (volatile to prevent compiler from optimizing out reads)
-var got_sigchld: bool = false;
-
-fn sigchld_handler(sig: i32) callconv(.c) void {
-    _ = sig;
-    @as(*volatile bool, @ptrCast(&got_sigchld)).* = true;
-}
-
-// in the main loop
-if (@as(*volatile bool, @ptrCast(&got_sigchld)).*) {
-    @as(*volatile bool, @ptrCast(&got_sigchld)).* = false;
-    while (true) {
-        const result = posix.waitpid(-1, posix.W.NOHANG);
-        if (result.pid == 0) break;
-        // handle child exit status...
-    }
-}
-```
-
-> SIGCHLD handler 在需要后台进程管理时才有意义。同步 `waitpid`（阻塞等待子进程）够用的场景下不需要。
+`sig_atomic_t` 保证处理函数与普通代码可以不可分割地读写这个简单标量，`volatile` 要求编译器每次实际访问它。对于同时等待终端、管道和子进程的事件循环，仅用标志还要处理“检查后、睡眠前又来了信号”的竞态。`sigsuspend()` 可以原子地临时替换信号掩码并进入等待；self-pipe 让处理函数向进程自己创建的管道写一个字节，使事件循环像监听普通 fd 一样监听信号；Linux 的 `signalfd()` 则直接把一组被阻塞信号转换成可读取的 fd。三种方案都遵循同一原则：处理函数只做受限工作，复杂状态更新回到普通控制流中完成。
 
 ## 小结
 
 | 概念 | 说明 |
 |------|------|
-| 信号(Signal) | 内核强制打断进程执行流的异步通知机制 |
-| 处置 | 收到信号时的动作：默认 / 忽略 / 自定义 handler |
-| `sigaction()` | 注册信号处理器 |
-| SA_RESTART | 被信号中断的慢速系统调用自动重启 |
-| SIGKILL / SIGSTOP | 不可捕获、不可忽略的信号 |
-| 终端驱动 | 内核中处理终端 I/O 的模块，行规程拦截特殊字符触发信号 |
-| 前台进程组 | Ctrl+C 发给整个前台进程组，不是单个进程 |
-| fork 继承 | 子进程继承信号处置，pending 从零开始 |
-| exec 重置 | 自定义 handler 重置为 SIG_DFL，SIG_IGN 保持不变 |
-| SIGCHLD | 子进程状态变化时内核通知父进程 |
-| async-signal-safety | handler 中只能调用有限的安全函数 |
+| 信号 | 由内核递送、可在普通函数调用顺序之外改变执行状态的通知 |
+| pending | 信号已经生成但尚未递送的状态 |
+| 信号掩码 | 每个线程当前阻塞递送的一组信号 |
+| 处置 | 默认动作、忽略或用户处理函数 |
+| `sigaction()` | 检查或设置信号处置、处理期掩码与行为标志 |
+| `SA_RESTART` | 允许一部分被处理函数中断的接口自动重启 |
+| `SIGKILL` / `SIGSTOP` | 不可捕获、不可忽略、不可阻塞的信号 |
+| 终端驱动 | 通过行规程把配置的控制字符转换为前台进程组信号 |
+| 信号继承 | fork 复制处置与掩码但清空 pending；exec 重置处理函数但保留掩码与 pending |
+| `SIGCHLD` | 子进程停止、继续或终止时通知父进程 |
+| 异步信号安全 | 处理函数中只能执行不会破坏被中断状态的有限操作 |
 
-信号不只是"杀进程"的工具，它是内核与进程之间、进程与进程之间的通知协议。Shell 必须主动管理信号的处置和继承，否则 Ctrl+C 会杀死 shell 自身，或者子进程会意外继承 shell 的信号策略。
+信号把事件生成与用户态处理分开，但这种控制流变化要求程序同时管理处置、掩码、继承和处理函数安全性；任何一项遗漏，都可能让 shell 自身或它启动的命令表现出错误的终止行为。
 
 ---
 
-**Linux 源码入口**：
-- [`kernel/signal.c`](https://elixir.bootlin.com/linux/latest/source/kernel/signal.c) — `do_send_sig_info()`：信号发送的核心路径
-- [`kernel/signal.c`](https://elixir.bootlin.com/linux/latest/source/kernel/signal.c) — `get_signal()`：信号递送，检查 pending 并执行处置
-- [`fs/exec.c`](https://elixir.bootlin.com/linux/latest/source/fs/exec.c) — `flush_signal_handlers()`：exec 时重置信号处理器
-
-:::practice 开始写 zish
-学完进程生命周期和信号这两课，你已经掌握了 fork/exec/wait、管道、信号处置和继承规则。这些正是实现一个 Shell 的基础 REPL 所需要的全部知识。
-
-前往 [zish-01：基础 REPL](/zish/01-repl) 开始实践。
-:::
-
+**Linux 与 POSIX 入口**：
+- [`kernel/signal.c`](https://elixir.bootlin.com/linux/latest/source/kernel/signal.c)：信号生成、挂起选择与递送核心路径
+- [`fs/exec.c`](https://elixir.bootlin.com/linux/latest/source/fs/exec.c)：`flush_signal_handlers()`，exec 时重置处理函数
+- [`signal(7)`](https://man7.org/linux/man-pages/man7/signal.7.html)：信号处置、掩码、pending 与继承总览
+- [`sigaction(2)`](https://man7.org/linux/man-pages/man2/sigaction.2.html)：`sigaction()` 与 `SA_RESTART`
+- [`termios(3)`](https://man7.org/linux/man-pages/man3/termios.3.html)：`ISIG`、`VINTR` 与其他终端控制字符
+- [`signal-safety(7)`](https://man7.org/linux/man-pages/man7/signal-safety.7.html)：异步信号安全接口清单
