@@ -4,10 +4,6 @@
   --vp-c-brand-3: #1d4ed8;
   --vp-c-brand-soft: rgba(37, 99, 235, 0.14);
 
-  --vp-c-bg: #fafaf8;
-  --vp-c-bg-soft: #f7f7f5;
-  --vp-c-bg-alt: #f5f5f3;
-
   --vp-sidebar-bg-color: var(--vp-c-bg);
 
   --vp-home-hero-name-color: var(--vp-c-text-1);
@@ -31,6 +27,14 @@
   --vp-button-alt-active-border: var(--vp-c-text-1);
   --vp-button-alt-active-text: var(--vp-c-text-1);
   --vp-button-alt-active-bg: transparent;
+}
+
+/* 暖色背景只在浅色主题生效：若直接在 :root 声明，会因特异性相同、打包顺序靠后
+   而在深色模式下覆盖 .dark 的背景变量，导致浅底浅字。 */
+html:not(.dark) {
+  --vp-c-bg: #fafaf8;
+  --vp-c-bg-soft: #f7f7f5;
+  --vp-c-bg-alt: #f5f5f3;
 }
 
 .dark {
